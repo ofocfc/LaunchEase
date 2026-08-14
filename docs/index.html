@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-Hans" data-repository="ofocfc/MacLaunch">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#050505">
+  <meta name="description" content="MacLaunch 是一款简洁、顺滑、贴近原生体验的 macOS 应用启动台。">
+  <title>MacLaunch — 熟悉的 macOS 应用启动台</title>
+  <link rel="icon" href="assets/icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <nav class="nav shell" aria-label="主导航">
+      <a class="brand" href="#top" aria-label="返回顶部">
+        <img src="assets/icon.png" alt="" width="34" height="34">
+        <span>MacLaunch</span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">功能</a>
+        <a href="#install">使用方法</a>
+        <a data-repository-link href="#">GitHub</a>
+        <a class="nav-download" data-release-download href="#">下载</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero shell">
+      <div class="hero-glow" aria-hidden="true"></div>
+      <img class="hero-icon" src="assets/icon.png" alt="MacLaunch 应用图标" width="192" height="192">
+      <p class="eyebrow">为 Mac 打造</p>
+      <h1>MacLaunch</h1>
+      <p class="hero-copy">把熟悉的启动台带回 macOS。简单、顺滑、安静地找到并启动每一个应用。</p>
+      <div class="hero-actions">
+        <a class="button button-primary" data-release-download href="#">
+          <span>下载 MacLaunch</span>
+          <span aria-hidden="true">↓</span>
+        </a>
+        <a class="button button-secondary" data-repository-link href="#">查看 GitHub</a>
+      </div>
+      <p class="release-meta">约 11 MB · Apple 芯片 · macOS 26.5+</p>
+
+      <figure class="product-frame hero-frame reveal">
+        <div class="window-bar" aria-hidden="true">
+          <span></span><span></span><span></span>
+          <b>MacLaunch</b>
+        </div>
+        <img src="assets/launchpad.jpg" alt="MacLaunch 应用启动台界面">
+      </figure>
+    </section>
+
+    <section class="intro shell" id="features">
+      <p class="section-kicker">为什么选择 MacLaunch</p>
+      <h2>回到熟悉的启动方式</h2>
+      <p>以桌面壁纸为背景，保留程序坞空间，用贴近系统的动效和布局呈现所有应用。没有复杂的学习成本，打开就是启动台。</p>
+    </section>
+
+    <section class="feature shell reveal">
+      <div class="feature-copy">
+        <span class="feature-number">01</span>
+        <h2>跟手、自然的翻页</h2>
+        <p>页面会跟随触控板或鼠标滚轮移动，再根据手势速度和距离自然停靠。到达第一页或最后一页时，不会错误循环跳转。</p>
+        <ul class="feature-list">
+          <li>Core Animation 原生渲染</li>
+          <li>实时页面指示器</li>
+          <li>支持触控板与鼠标滚轮</li>
+        </ul>
+      </div>
+      <div class="visual-card motion-demo" aria-label="翻页效果示意">
+        <div class="page-strip">
+          <div class="mock-page">
+            <i class="mock-search"></i>
+            <div class="mock-grid">
+              <span></span><span></span><span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+          <div class="mock-page second-page">
+            <i class="mock-search"></i>
+            <div class="mock-grid">
+              <span></span><span></span><span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+        </div>
+        <div class="mock-dots"><b></b><i></i><i></i></div>
+      </div>
+    </section>
+
+    <section class="feature shell feature-reverse reveal">
+      <div class="feature-copy">
+        <span class="feature-number">02</span>
+        <h2>图标、文件夹和排序</h2>
+        <p>拖动图标即可改变位置，其他图标会自动补位。把应用拖到另一个图标上可创建文件夹，也能随时将应用拖出。</p>
+        <ul class="feature-list">
+          <li>自由拖动与自动补位</li>
+          <li>毛玻璃文件夹面板</li>
+          <li>布局自动保存</li>
+        </ul>
+      </div>
+      <div class="visual-card folder-demo" aria-label="应用文件夹效果示意">
+        <div class="folder-panel">
+          <strong>效率工具</strong>
+          <div class="folder-grid">
+            <span class="app-tile blue">A</span>
+            <span class="app-tile violet">⌘</span>
+            <span class="app-tile orange">⚡</span>
+            <span class="app-tile green">✓</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="feature shell reveal">
+      <div class="feature-copy">
+        <span class="feature-number">03</span>
+        <h2>按照你的 Mac 调整</h2>
+        <p>添加任意应用文件夹，自定义行列数。图标尺寸与上下间距会根据屏幕、网格和程序坞大小自动适配。</p>
+        <ul class="feature-list">
+          <li>自定义扫描文件夹</li>
+          <li>可调行数与列数</li>
+          <li>自动避让程序坞</li>
+        </ul>
+      </div>
+      <div class="visual-card settings-demo" aria-label="启动台设置界面示意">
+        <div class="settings-window">
+          <div class="settings-title">启动台设置</div>
+          <div class="setting-row"><span>应用文件夹</span><b>/Applications</b></div>
+          <div class="setting-row"><span>行数</span><div class="stepper">− <b>5</b> ＋</div></div>
+          <div class="setting-row"><span>列数</span><div class="stepper">− <b>7</b> ＋</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="feature shell feature-reverse reveal">
+      <div class="feature-copy">
+        <span class="feature-number">04</span>
+        <h2>搜索，然后立即启动</h2>
+        <p>保留应用的原生显示名称，输入名称即可快速过滤。点击应用后立即启动，并自动隐藏 MacLaunch。</p>
+        <ul class="feature-list">
+          <li>原生应用名称</li>
+          <li>实时搜索过滤</li>
+          <li>启动应用后自动退出</li>
+        </ul>
+      </div>
+      <div class="visual-card search-demo" aria-label="搜索应用效果示意">
+        <div class="search-box"><span>⌕</span><b>搜索应用</b><i>×</i></div>
+        <div class="search-results">
+          <div><span class="app-tile blue">A</span><b>App Store</b></div>
+          <div><span class="app-tile chrome">●</span><b>Google Chrome</b></div>
+          <div><span class="app-tile dark">›_</span><b>终端</b></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="install shell" id="install">
+      <p class="section-kicker">无需安装器</p>
+      <h2>三步开始使用</h2>
+      <div class="steps">
+        <article class="reveal">
+          <span>1</span>
+          <h3>下载并解压</h3>
+          <p>下载最新版 MacLaunch.zip，然后双击解压。</p>
+        </article>
+        <article class="reveal">
+          <span>2</span>
+          <h3>拖入应用程序</h3>
+          <p>将 MacLaunch.app 拖进 Mac 的“应用程序”文件夹。</p>
+        </article>
+        <article class="reveal">
+          <span>3</span>
+          <h3>首次打开</h3>
+          <p>右键应用并选择“打开”，之后就能正常双击启动。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="download-cta shell reveal">
+      <img src="assets/icon.png" alt="" width="96" height="96">
+      <h2>让应用触手可及</h2>
+      <p>打开 MacLaunch，回到简单、直观的启动体验。</p>
+      <a class="button button-primary" data-release-download href="#">下载最新版</a>
+    </section>
+  </main>
+
+  <footer class="footer shell">
+    <a class="brand" href="#top">
+      <img src="assets/icon.png" alt="" width="30" height="30">
+      <span>MacLaunch</span>
+    </a>
+    <p>熟悉的 macOS 应用启动台</p>
+    <div>
+      <a data-repository-link href="#">GitHub</a>
+      <a data-release-download href="#">下载</a>
+    </div>
+    <small>© <span id="year"></span> MacLaunch</small>
+  </footer>
+</body>
+</html>
