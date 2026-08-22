@@ -49,13 +49,26 @@ LaunchEase 是一款使用 SwiftUI、AppKit 和 Core Animation 编写的免费�
 2. 将 `LaunchEase.app` 拖入“应用程序”文件夹。
 3. 首次启动时右键应用，选择“打开”。
 
-如果 macOS 仍然阻止启动，可以在终端执行：
+### 首次打开被 macOS 拦截
+
+当前预编译版本尚未经过 Apple 公证，因此首次运行时 macOS 可能提示“无法打开”“无法验证开发者”，或直接阻止应用启动。这不代表应用文件已损坏。
+
+请先在“应用程序”文件夹中右键 `LaunchEase.app`，选择“打开”。如果仍被阻止：
+
+1. 打开 `系统设置 → 隐私与安全性`。
+2. 向下滚动到“安全性”区域，找到有关 LaunchEase 被阻止的提示。
+3. 点击“仍要打开”，使用 Touch ID 或输入 Mac 登录密码确认。
+4. 在随后出现的确认窗口中再次点击“仍要打开”。
+
+> 仅在确认应用来自本项目的 [GitHub Releases](https://github.com/ofocfc/LaunchEase/releases/latest) 时执行上述操作。
+
+如果“仍要打开”按钮没有出现，可以先尝试启动一次 LaunchEase，再返回“隐私与安全性”。也可以在终端移除从互联网下载的隔离标记：
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/LaunchEase.app
 ```
 
-> 当前预编译版本使用本地临时签名，尚未进行 Apple Developer ID 签名和公证。
+> 当前预编译版本使用本地临时签名，尚未进行 Apple Developer ID 签名和公证。未来完成正式签名与公证后，此提示将不再出现。
 
 ## 系统要求
 

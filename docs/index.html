@@ -28,7 +28,10 @@
         <a href="#opensource">开源</a>
         <a data-repository-link href="#">GitHub</a>
       </div>
-      <a class="nav-download" data-release-download href="#">免费下载</a>
+      <div class="nav-actions">
+        <button class="language-toggle" id="language-toggle" type="button" aria-label="Switch to English">EN</button>
+        <a class="nav-download" data-release-download href="#">免费下载</a>
+      </div>
     </nav>
   </header>
 
@@ -232,8 +235,22 @@
         <span aria-hidden="true">→</span>
         <article class="reveal"><b>2</b><h3>拖入应用程序</h3><p>将 App 放进“应用程序”文件夹。</p></article>
         <span aria-hidden="true">→</span>
-        <article class="reveal"><b>3</b><h3>右键打开</h3><p>首次运行选择“打开”即可。</p></article>
+        <article class="reveal"><b>3</b><h3>右键打开</h3><p>首次运行先右键应用并选择“打开”。</p></article>
       </div>
+      <aside class="security-note reveal" aria-label="首次打开说明">
+        <div class="security-note-icon" aria-hidden="true">⌘</div>
+        <div>
+          <span class="section-label">首次运行</span>
+          <h3>提示“无法打开”时，请在系统设置中放行。</h3>
+          <p>当前下载版尚未经过 Apple 公证。如果右键打开后仍被阻止，请按照下面的步骤操作：</p>
+          <ol>
+            <li>打开“系统设置 → 隐私与安全性”。</li>
+            <li>向下找到“安全性”区域，在 LaunchEase 提示旁点击“仍要打开”。</li>
+            <li>使用 Touch ID 或输入 Mac 登录密码，然后再次确认“仍要打开”。</li>
+          </ol>
+          <small>仅在确认应用从 LaunchEase 官方 GitHub Releases 下载时执行此操作。</small>
+        </div>
+      </aside>
     </section>
 
     <section class="final-cta shell reveal">
