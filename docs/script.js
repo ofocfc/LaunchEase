@@ -19,8 +19,8 @@
 
   const repo = repositoryURL();
   const release = repo === "#"
-    ? "../dist/MacLaunch.zip"
-    : `${repo}/releases/latest/download/MacLaunch.zip`;
+    ? "../dist/LaunchEase.zip"
+    : `${repo}/releases/latest/download/LaunchEase.zip`;
 
   document.querySelectorAll("[data-repository-link]").forEach((link) => {
     link.href = repo;

@@ -7,12 +7,13 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		F32320DD302F4251002C9A1F /* MacLaunch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacLaunch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F32320DD302F4251002C9A1F /* LaunchEase.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LaunchEase.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		F32320DF302F4251002C9A1F /* MacLaunch */ = {
+		F32320DF302F4251002C9A1F /* LaunchEase */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			name = LaunchEase;
 			path = MacLaunch;
 			sourceTree = "<group>";
 		};
@@ -32,7 +33,7 @@
 		F32320D4302F4251002C9A1F = {
 			isa = PBXGroup;
 			children = (
-				F32320DF302F4251002C9A1F /* MacLaunch */,
+				F32320DF302F4251002C9A1F /* LaunchEase */,
 				F32320DE302F4251002C9A1F /* Products */,
 			);
 			sourceTree = "<group>";
@@ -40,7 +41,7 @@
 		F32320DE302F4251002C9A1F /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				F32320DD302F4251002C9A1F /* MacLaunch.app */,
+				F32320DD302F4251002C9A1F /* LaunchEase.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -48,9 +49,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		F32320DC302F4251002C9A1F /* MacLaunch */ = {
+		F32320DC302F4251002C9A1F /* LaunchEase */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = F32320E8302F4252002C9A1F /* Build configuration list for PBXNativeTarget "MacLaunch" */;
+			buildConfigurationList = F32320E8302F4252002C9A1F /* Build configuration list for PBXNativeTarget "LaunchEase" */;
 			buildPhases = (
 				F32320D9302F4251002C9A1F /* Sources */,
 				F32320DA302F4251002C9A1F /* Frameworks */,
@@ -61,13 +62,13 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				F32320DF302F4251002C9A1F /* MacLaunch */,
+				F32320DF302F4251002C9A1F /* LaunchEase */,
 			);
-			name = MacLaunch;
+			name = LaunchEase;
 			packageProductDependencies = (
 			);
-			productName = MacLaunch;
-			productReference = F32320DD302F4251002C9A1F /* MacLaunch.app */;
+			productName = LaunchEase;
+			productReference = F32320DD302F4251002C9A1F /* LaunchEase.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -85,7 +86,7 @@
 					};
 				};
 			};
-			buildConfigurationList = F32320D8302F4251002C9A1F /* Build configuration list for PBXProject "MacLaunch" */;
+			buildConfigurationList = F32320D8302F4251002C9A1F /* Build configuration list for PBXProject "LaunchEase" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -99,7 +100,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				F32320DC302F4251002C9A1F /* MacLaunch */,
+				F32320DC302F4251002C9A1F /* LaunchEase */,
 			);
 		};
 /* End PBXProject section */
@@ -255,14 +256,16 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = LaunchEase;
+				INFOPLIST_KEY_CFBundleName = LaunchEase;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.launch.MacLaunch;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = LaunchEase;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -285,14 +288,16 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = LaunchEase;
+				INFOPLIST_KEY_CFBundleName = LaunchEase;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.launch.MacLaunch;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = LaunchEase;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -306,7 +311,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		F32320D8302F4251002C9A1F /* Build configuration list for PBXProject "MacLaunch" */ = {
+		F32320D8302F4251002C9A1F /* Build configuration list for PBXProject "LaunchEase" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				F32320E6302F4252002C9A1F /* Debug */,
@@ -315,7 +320,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		F32320E8302F4252002C9A1F /* Build configuration list for PBXNativeTarget "MacLaunch" */ = {
+		F32320E8302F4252002C9A1F /* Build configuration list for PBXNativeTarget "LaunchEase" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				F32320E9302F4252002C9A1F /* Debug */,

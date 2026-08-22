@@ -45,6 +45,17 @@ struct LaunchpadItem: Identifiable {
     }
 }
 
+struct LaunchpadLayoutBackup: Codable {
+    struct Folder: Codable {
+        let id: String
+        let name: String
+        let appIDs: [String]
+    }
+
+    let order: [String]
+    let folders: [Folder]
+}
+
 @MainActor
 final class LaunchpadLayoutStore: ObservableObject {
     @Published private(set) var items: [LaunchpadItem] = []
@@ -77,6 +88,7 @@ final class LaunchpadLayoutStore: ObservableObject {
         let appsByID = Dictionary(uniqueKeysWithValues: apps.map { ($0.id, $0) })
         var claimedAppIDs = Set<String>()
         var foldersByID: [String: LaunchpadFolder] = [:]
+        var dissolvedAppsByFolderID: [String: InstalledApp] = [:]
 
         for storedFolder in storedLayout.folders {
             let folderApps = storedFolder.appIDs.compactMap { appID -> InstalledApp? in
@@ -84,25 +96,33 @@ final class LaunchpadLayoutStore: ObservableObject {
                 return appsByID[appID]
             }
 
-            guard folderApps.count >= 2 else {
-                folderApps.forEach { claimedAppIDs.remove($0.id) }
-                continue
+            if folderApps.count == 1, let remainingApp = folderApps.first {
+                dissolvedAppsByFolderID[storedFolder.id] = remainingApp
+            } else if folderApps.count >= 2 {
+                let storedName = storedFolder.name.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                foldersByID[storedFolder.id] = LaunchpadFolder(
+                    id: storedFolder.id,
+                    name: storedName.isEmpty ? "文件夹" : storedName,
+                    apps: folderApps
+                )
             }
-
-            foldersByID[storedFolder.id] = LaunchpadFolder(
-                id: storedFolder.id,
-                name: storedFolder.name,
-                apps: folderApps
-            )
         }
 
         var nextItems: [LaunchpadItem] = []
         var insertedItemIDs = Set<String>()
 
-        for itemID in storedLayout.order where insertedItemIDs.insert(itemID).inserted {
-            if let folder = foldersByID[itemID] {
+        for itemID in storedLayout.order {
+            if let folder = foldersByID[itemID],
+               insertedItemIDs.insert(folder.id).inserted {
                 nextItems.append(LaunchpadItem(content: .folder(folder)))
-            } else if let app = appsByID[itemID], !claimedAppIDs.contains(itemID) {
+            } else if let app = dissolvedAppsByFolderID[itemID],
+                      insertedItemIDs.insert(app.id).inserted {
+                nextItems.append(LaunchpadItem(content: .app(app)))
+            } else if let app = appsByID[itemID],
+                      !claimedAppIDs.contains(itemID),
+                      insertedItemIDs.insert(app.id).inserted {
                 nextItems.append(LaunchpadItem(content: .app(app)))
             }
         }
@@ -134,6 +154,17 @@ final class LaunchpadLayoutStore: ObservableObject {
 
         let insertionIndex = targetIndex + (movesForward ? 1 : 0)
         items.insert(item, at: min(insertionIndex, items.count))
+        persistCurrentItems()
+    }
+
+    func move(_ sourceID: String, to destinationIndex: Int) {
+        guard let sourceIndex = items.firstIndex(where: { $0.id == sourceID }) else {
+            return
+        }
+
+        let item = items.remove(at: sourceIndex)
+        let insertionIndex = min(max(0, destinationIndex), items.count)
+        items.insert(item, at: insertionIndex)
         persistCurrentItems()
     }
 
@@ -185,7 +216,13 @@ final class LaunchpadLayoutStore: ObservableObject {
 
         let extractedApp = folder.apps.remove(at: appIndex)
 
-        if folder.apps.count == 1, let remainingApp = folder.apps.first {
+        if folder.apps.isEmpty {
+            items.remove(at: folderIndex)
+            items.insert(
+                LaunchpadItem(content: .app(extractedApp)),
+                at: min(folderIndex, items.count)
+            )
+        } else if folder.apps.count == 1, let remainingApp = folder.apps.first {
             // Launchpad automatically dissolves a folder once only one app is
             // left. Keep both apps next to the former folder position.
             items.remove(at: folderIndex)
@@ -222,7 +259,9 @@ final class LaunchpadLayoutStore: ObservableObject {
 
         let extractedApp = folder.apps.remove(at: appIndex)
 
-        if folder.apps.count == 1, let remainingApp = folder.apps.first {
+        if folder.apps.isEmpty {
+            items.remove(at: folderIndex)
+        } else if folder.apps.count == 1, let remainingApp = folder.apps.first {
             items[folderIndex] = LaunchpadItem(content: .app(remainingApp))
         } else {
             items[folderIndex] = LaunchpadItem(content: .folder(folder))
@@ -237,9 +276,9 @@ final class LaunchpadLayoutStore: ObservableObject {
     }
 
     func renameFolder(_ folderID: String, to proposedName: String) {
-        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty,
-              let index = items.firstIndex(where: { $0.id == folderID }),
+        let proposedName = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = proposedName.isEmpty ? "文件夹" : proposedName
+        guard let index = items.firstIndex(where: { $0.id == folderID }),
               var folder = items[index].folder
         else { return }
 
@@ -273,6 +312,47 @@ final class LaunchpadLayoutStore: ObservableObject {
         items.first(where: { $0.id == folderID })?.folder
     }
 
+    func makeBackup() -> LaunchpadLayoutBackup {
+        LaunchpadLayoutBackup(
+            order: storedLayout.order,
+            folders: storedLayout.folders.map { folder in
+                LaunchpadLayoutBackup.Folder(
+                    id: folder.id,
+                    name: folder.name,
+                    appIDs: folder.appIDs
+                )
+            }
+        )
+    }
+
+    func stageRestore(from backup: LaunchpadLayoutBackup) {
+        var insertedOrderIDs = Set<String>()
+        let order = backup.order.filter { insertedOrderIDs.insert($0).inserted }
+        var insertedFolderIDs = Set<String>()
+        let folders = backup.folders.compactMap { folder -> StoredFolder? in
+            let folderID = folder.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !folderID.isEmpty,
+                  insertedFolderIDs.insert(folderID).inserted
+            else { return nil }
+
+            var insertedAppIDs = Set<String>()
+            let appIDs = folder.appIDs.filter { appID in
+                !appID.isEmpty && insertedAppIDs.insert(appID).inserted
+            }
+            let proposedName = folder.name.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            return StoredFolder(
+                id: folderID,
+                name: proposedName.isEmpty ? "文件夹" : proposedName,
+                appIDs: appIDs
+            )
+        }
+
+        storedLayout = StoredLayout(order: order, folders: folders)
+        persistStoredLayout()
+    }
+
     private func persistCurrentItems() {
         storedLayout = StoredLayout(
             order: items.map(\.id),
@@ -286,9 +366,12 @@ final class LaunchpadLayoutStore: ObservableObject {
             }
         )
 
-        if let data = try? JSONEncoder().encode(storedLayout) {
-            defaults.set(data, forKey: Keys.layout)
-        }
+        persistStoredLayout()
+    }
+
+    private func persistStoredLayout() {
+        guard let data = try? JSONEncoder().encode(storedLayout) else { return }
+        defaults.set(data, forKey: Keys.layout)
     }
 
     private enum Keys {

@@ -2,6 +2,13 @@ import AppKit
 import QuartzCore
 import SwiftUI
 
+enum LaunchpadMotion {
+    static let quick: TimeInterval = 0.14
+    static let standard: TimeInterval = 0.2
+    static let folderResponse: TimeInterval = 0.32
+    static let folderDamping: CGFloat = 0.9
+}
+
 struct LaunchpadTileStyle {
     let iconSize: CGFloat
     let titleFontSize: CGFloat
@@ -22,6 +29,8 @@ struct LaunchpadGridMetrics {
     let columnPitch: CGFloat
     let rowPitch: CGFloat
     let gridStartY: CGFloat
+    let viewportWidth: CGFloat
+    let configuredRowCount: Int
 
     init(
         size: CGSize,
@@ -41,27 +50,44 @@ struct LaunchpadGridMetrics {
         let availableWidth = max(1, size.width - horizontalInset * 2)
         let availableHeight = max(1, size.height - topInset - bottomInset)
 
-        // 7 x 5 is the visual baseline. Sparse grids grow gently while denser
-        // layouts shrink, with the current screen and Dock providing hard caps.
-        let densityScale = sqrt(35 / CGFloat(columns * rows))
-        let densityIconSize = 94 * densityScale
-        let widthLimitedIconSize = availableWidth / CGFloat(columns) - 24
-        let provisionalFontSize = min(15, max(11, densityIconSize * 0.145))
-        let provisionalTitleHeight = provisionalFontSize * 2.4
-        let provisionalSpacing = min(11, max(7, densityIconSize * 0.115))
-        let heightLimitedIconSize = (
-            availableHeight - CGFloat(max(0, rows - 1)) * 6
-        ) / CGFloat(rows) - provisionalTitleHeight - provisionalSpacing
+        // macOS Launchpad lays out a page as evenly sized cells. Use 7 x 5 as
+        // the reference density, then let each axis contribute independently
+        // so changing only columns (or only rows) still visibly changes the
+        // icon size. Columns carry a little more weight on a wide Mac display.
+        let columnScale = CGFloat(
+            pow(Double(7) / Double(columns), 1.12)
+        )
+        let rowScale = CGFloat(
+            pow(Double(5) / Double(rows), 0.42)
+        )
+        let adaptiveIconSize = 104 * columnScale * rowScale
+
+        // Reserve a small gap between adjacent tile frames. LaunchpadTileStyle
+        // is wider than the icon so long names and drag targets remain usable.
+        let columnPitch = availableWidth / CGFloat(columns)
+        let maximumTileWidth = max(1, columnPitch - 8)
+        let widthLimitedIconSize = min(
+            maximumTileWidth - 28,
+            maximumTileWidth / 1.42
+        )
+        let provisionalFontSize = min(15, max(11, adaptiveIconSize * 0.135))
+        let provisionalTitleHeight = provisionalFontSize * 2.2
+        let provisionalSpacing = min(10, max(6, adaptiveIconSize * 0.09))
+        let rowCellHeight = availableHeight / CGFloat(rows)
+        let heightLimitedIconSize = rowCellHeight
+            - provisionalTitleHeight
+            - provisionalSpacing
+            - 2
         let iconSize = min(
-            112,
+            184,
             max(
                 42,
-                min(densityIconSize, widthLimitedIconSize, heightLimitedIconSize)
+                min(adaptiveIconSize, widthLimitedIconSize, heightLimitedIconSize)
             )
         )
-        let titleFontSize = min(15, max(11, iconSize * 0.145))
-        let titleHeight = titleFontSize * 2.4
-        let iconTitleSpacing = min(11, max(7, iconSize * 0.115))
+        let titleFontSize = min(15, max(11, iconSize * 0.135))
+        let titleHeight = titleFontSize * 2.2
+        let iconTitleSpacing = min(10, max(6, iconSize * 0.09))
         let tileStyle = LaunchpadTileStyle(
             iconSize: iconSize,
             titleFontSize: titleFontSize,
@@ -69,18 +95,17 @@ struct LaunchpadGridMetrics {
             iconTitleSpacing: iconTitleSpacing
         )
         let tileHeight = tileStyle.tileSize.height
-        let rawRowSpacing = rows > 1
-            ? (availableHeight - CGFloat(rows) * tileHeight) / CGFloat(rows - 1)
-            : 0
-        let rowSpacing = rows > 1 ? min(64, max(6, rawRowSpacing)) : 0
-        let contentHeight = CGFloat(rows) * tileHeight
-            + CGFloat(max(0, rows - 1)) * rowSpacing
 
         self.tileStyle = tileStyle
         self.horizontalInset = horizontalInset
-        columnPitch = availableWidth / CGFloat(columns)
-        rowPitch = tileHeight + rowSpacing
-        gridStartY = topInset + max(0, (availableHeight - contentHeight) / 2)
+        self.columnPitch = columnPitch
+        viewportWidth = size.width
+        configuredRowCount = rows
+        // Center every tile in its row cell instead of clamping the gap to a
+        // fixed value. This keeps the first/last rows balanced and makes row
+        // spacing expand or contract smoothly with the selected row count.
+        rowPitch = rowCellHeight
+        gridStartY = topInset + max(0, (rowCellHeight - tileHeight) / 2)
     }
 
     func tileOrigin(row: Int, column: Int) -> CGPoint {
@@ -89,6 +114,27 @@ struct LaunchpadGridMetrics {
                 + CGFloat(column) * columnPitch
                 + (columnPitch - tileStyle.tileSize.width) / 2,
             y: gridStartY + CGFloat(row) * rowPitch
+        )
+    }
+
+    func centeredTileOrigin(
+        row: Int,
+        column: Int,
+        itemCountInRow: Int,
+        visibleRowCount: Int
+    ) -> CGPoint {
+        let rowWidth = CGFloat(itemCountInRow) * columnPitch
+        let centeredRowStart = (viewportWidth - rowWidth) / 2
+        let verticalOffset = CGFloat(max(0, configuredRowCount - visibleRowCount))
+            * rowPitch / 2
+
+        return CGPoint(
+            x: centeredRowStart
+                + CGFloat(column) * columnPitch
+                + (columnPitch - tileStyle.tileSize.width) / 2,
+            y: gridStartY
+                + CGFloat(row) * rowPitch
+                + verticalOffset
         )
     }
 
@@ -106,11 +152,18 @@ struct CoreAnimationPager: NSViewRepresentable {
     let columnCount: Int
     let rowCount: Int
     let horizontalInset: CGFloat
+    let centersContent: Bool
+    let showsPageIndicator: Bool
+    let reduceMotion: Bool
+    let increasedContrast: Bool
     @Binding var selectedPage: Int
+    @Binding var keyboardSelectedItemID: String?
+    let keyboardActivationRequest: Int
     let openAction: (InstalledApp) -> Void
     let revealAction: (InstalledApp) -> Void
-    let openFolderAction: (String) -> Void
+    let openFolderAction: (String, CGPoint) -> Void
     let moveAction: (String, String) -> Void
+    let moveToIndexAction: (String, Int) -> Void
     let mergeAction: (String, String) -> Void
     let allowsEditing: Bool
     let dismissAction: () -> Void
@@ -125,25 +178,41 @@ struct CoreAnimationPager: NSViewRepresentable {
                 selectedPage = page
             }
         }
+        nsView.keyboardSelectionDidChange = { itemID in
+            if keyboardSelectedItemID != itemID {
+                keyboardSelectedItemID = itemID
+            }
+        }
         nsView.update(
             pages: pages,
             columnCount: columnCount,
             rowCount: rowCount,
             horizontalInset: horizontalInset,
+            centersContent: centersContent,
+            showsPageIndicator: showsPageIndicator,
+            reduceMotion: reduceMotion,
+            increasedContrast: increasedContrast,
             openAction: openAction,
             revealAction: revealAction,
             openFolderAction: openFolderAction,
             moveAction: moveAction,
+            moveToIndexAction: moveToIndexAction,
             mergeAction: mergeAction,
             allowsEditing: allowsEditing,
             dismissAction: dismissAction
         )
-        nsView.setPage(selectedPage, animated: !context.transaction.disablesAnimations)
+        nsView.setPage(
+            selectedPage,
+            animated: !reduceMotion && !context.transaction.disablesAnimations
+        )
+        nsView.setKeyboardSelection(keyboardSelectedItemID)
+        nsView.activateKeyboardSelection(request: keyboardActivationRequest)
     }
 }
 
-final class LaunchpadPagingView: NSView {
+final class LaunchpadPagingView: NSView, NSDraggingSource {
     var pageDidChange: ((Int) -> Void)?
+    var keyboardSelectionDidChange: ((String?) -> Void)?
 
     private let scrollView = LaunchpadScrollView()
     private let documentView = FlippedDocumentView()
@@ -151,10 +220,15 @@ final class LaunchpadPagingView: NSView {
     private var columnCount = 1
     private var rowCount = 1
     private var horizontalInset: CGFloat = 56
+    private var centersContent = false
+    private var showsPageIndicator = false
+    private var reduceMotion = false
+    private var increasedContrast = false
     private var openAction: ((InstalledApp) -> Void)?
     private var revealAction: ((InstalledApp) -> Void)?
-    private var openFolderAction: ((String) -> Void)?
+    private var openFolderAction: ((String, CGPoint) -> Void)?
     private var moveAction: ((String, String) -> Void)?
+    private var moveToIndexAction: ((String, Int) -> Void)?
     private var mergeAction: ((String, String) -> Void)?
     private var allowsEditing = true
     private var dismissAction: (() -> Void)?
@@ -189,7 +263,10 @@ final class LaunchpadPagingView: NSView {
     private var reorderWorkItem: DispatchWorkItem?
     private var pendingReorderTargetID: String?
     private var edgePageWorkItem: DispatchWorkItem?
+    private var scheduledEdgePageDestination: Int?
     private var lastDragLocationInWindow = CGPoint.zero
+    private var keyboardSelectedItemID: String?
+    private var lastKeyboardActivationRequest = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -259,18 +336,27 @@ final class LaunchpadPagingView: NSView {
         columnCount: Int,
         rowCount: Int,
         horizontalInset: CGFloat,
+        centersContent: Bool,
+        showsPageIndicator: Bool,
+        reduceMotion: Bool,
+        increasedContrast: Bool,
         openAction: @escaping (InstalledApp) -> Void,
         revealAction: @escaping (InstalledApp) -> Void,
-        openFolderAction: @escaping (String) -> Void,
+        openFolderAction: @escaping (String, CGPoint) -> Void,
         moveAction: @escaping (String, String) -> Void,
+        moveToIndexAction: @escaping (String, Int) -> Void,
         mergeAction: @escaping (String, String) -> Void,
         allowsEditing: Bool,
         dismissAction: @escaping () -> Void
     ) {
+        let changesSearchPresentation = !contentSignature.isEmpty
+            && self.centersContent != centersContent
+
         self.openAction = openAction
         self.revealAction = revealAction
         self.openFolderAction = openFolderAction
         self.moveAction = moveAction
+        self.moveToIndexAction = moveToIndexAction
         self.mergeAction = mergeAction
         self.allowsEditing = allowsEditing
         self.dismissAction = dismissAction
@@ -280,6 +366,8 @@ final class LaunchpadPagingView: NSView {
             .map(\.id)
             .joined(separator: "\u{1F}")
             + "|\(columnCount)|\(rowCount)|\(horizontalInset)"
+            + "|\(centersContent)|\(showsPageIndicator)"
+            + "|\(reduceMotion)|\(increasedContrast)"
 
         guard signature != contentSignature else { return }
         contentSignature = signature
@@ -287,7 +375,18 @@ final class LaunchpadPagingView: NSView {
         self.columnCount = max(1, columnCount)
         self.rowCount = max(1, rowCount)
         self.horizontalInset = horizontalInset
+        self.centersContent = centersContent
+        self.showsPageIndicator = showsPageIndicator
+        self.reduceMotion = reduceMotion
+        self.increasedContrast = increasedContrast
         currentPage = min(currentPage, max(0, pages.count - 1))
+        if changesSearchPresentation && !reduceMotion {
+            let transition = CATransition()
+            transition.type = .fade
+            transition.duration = LaunchpadMotion.standard
+            transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            documentView.layer?.add(transition, forKey: "searchPresentation")
+        }
         rebuildPages()
     }
 
@@ -302,7 +401,7 @@ final class LaunchpadPagingView: NSView {
             return
         }
 
-        guard animated, targetPage != currentPage else {
+        guard animated, !reduceMotion, targetPage != currentPage else {
             currentPage = targetPage
             pendingPage = targetPage
             displayedOffset = target.x
@@ -317,6 +416,38 @@ final class LaunchpadPagingView: NSView {
         }
 
         animate(to: targetPage)
+    }
+
+    func setKeyboardSelection(_ itemID: String?) {
+        keyboardSelectedItemID = itemID
+        var foundSelection = itemID == nil
+        for tile in allTiles {
+            let isSelected = tile.item.id == itemID
+            tile.setKeyboardFocused(isSelected)
+            foundSelection = foundSelection || isSelected
+        }
+
+        if !foundSelection {
+            keyboardSelectedItemID = nil
+            keyboardSelectionDidChange?(nil)
+        }
+    }
+
+    func activateKeyboardSelection(request: Int) {
+        guard request != lastKeyboardActivationRequest else { return }
+        lastKeyboardActivationRequest = request
+        guard let keyboardSelectedItemID,
+              let tile = allTiles.first(where: { $0.item.id == keyboardSelectedItemID })
+        else { return }
+        tile.activateItem()
+    }
+
+    private var allTiles: [LaunchpadItemTileView] {
+        documentView.subviews
+            .compactMap { $0 as? LaunchpadPageView }
+            .flatMap { page in
+                page.subviews.compactMap { $0 as? LaunchpadItemTileView }
+            }
     }
 
     fileprivate func handleScrollWheel(_ event: NSEvent) {
@@ -422,6 +553,22 @@ final class LaunchpadPagingView: NSView {
 
     private func animate(to page: Int) {
         let targetPage = min(max(0, page), max(0, pages.count - 1))
+        if reduceMotion {
+            let offset = CGFloat(targetPage) * bounds.width
+            currentPage = targetPage
+            pendingPage = targetPage
+            displayedOffset = offset
+            targetOffset = offset
+            scrollVelocity = 0
+            isInteracting = false
+            isSnapping = false
+            accumulatedScroll = 0
+            scrollView.contentView.scroll(to: NSPoint(x: offset, y: 0))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            displayLink?.isPaused = true
+            reportPage(targetPage)
+            return
+        }
         pendingPage = targetPage
         targetOffset = CGFloat(targetPage) * bounds.width
         isInteracting = false
@@ -481,6 +628,9 @@ final class LaunchpadPagingView: NSView {
         link.isPaused = true
         lastDisplayTimestamp = 0
         reportPage(pendingPage)
+        if draggingTile != nil {
+            scheduleEdgePageIfNeeded(at: lastDragLocationInWindow)
+        }
     }
 
     private func reportPage(_ page: Int) {
@@ -547,12 +697,141 @@ final class LaunchpadPagingView: NSView {
     fileprivate func updateDragging(
         _ tile: LaunchpadItemTileView,
         with event: NSEvent
-    ) {
-        guard draggingTile === tile else { return }
+    ) -> Bool {
+        guard draggingTile === tile else { return false }
         lastDragLocationInWindow = event.locationInWindow
         positionDraggingTile()
+
+        if let app = tile.item.app,
+           isInsideDockDropRegion(
+               event: event,
+               iconSize: tile.dockDraggingIconSize
+           ) {
+            beginSystemDockDrag(app: app, tile: tile, event: event)
+            return true
+        }
+
         updateHoveredTile(at: event.locationInWindow)
         scheduleEdgePageIfNeeded(at: event.locationInWindow)
+        return false
+    }
+
+    private func beginSystemDockDrag(
+        app: InstalledApp,
+        tile: LaunchpadItemTileView,
+        event: NSEvent
+    ) {
+        cancelDragScheduling()
+        hoveredTile?.setMergeHighlighted(false)
+        hoveredTile = nil
+        hoverBecameMergeTarget = false
+        applyReorderPreview(targetID: nil, animated: true)
+
+        let existingProxyFrame = dragProxy.map { proxy in
+            convert(proxy.bounds, from: proxy)
+        }
+        dragProxy?.removeFromSuperview()
+        dragProxy = nil
+        tile.frame = dragOriginalFrame
+        tile.alphaValue = 1
+        draggingTile = nil
+        dragOriginalPage = nil
+        dragPageTiles = []
+        dragPageFrames = []
+        proposedReorderTargetID = nil
+        isShowingReorderPreview = false
+
+        let draggingItem = NSDraggingItem(pasteboardWriter: app.url as NSURL)
+        let iconSide = tile.dockDraggingIconSize
+        let dragSize = CGSize(width: iconSide, height: iconSide)
+        let location = convert(event.locationInWindow, from: nil)
+        let dragOrigin: CGPoint
+        if let existingProxyFrame {
+            dragOrigin = CGPoint(
+                x: existingProxyFrame.midX - dragSize.width / 2,
+                y: existingProxyFrame.maxY - dragSize.height
+            )
+        } else {
+            dragOrigin = CGPoint(
+                x: location.x - dragSize.width / 2,
+                y: location.y - dragSize.height / 2
+            )
+        }
+        draggingItem.setDraggingFrame(
+            CGRect(origin: dragOrigin, size: dragSize),
+            contents: app.icon
+        )
+
+        let session = beginDraggingSession(
+            with: [draggingItem],
+            event: event,
+            source: self
+        )
+        session.animatesToStartingPositionsOnCancelOrFail = true
+        NSHapticFeedbackManager.defaultPerformer.perform(
+            .alignment,
+            performanceTime: .now
+        )
+    }
+
+    private func isInsideDockDropRegion(
+        event: NSEvent,
+        iconSize: CGFloat
+    ) -> Bool {
+        guard let window,
+              let screen = window.screen
+        else { return false }
+
+        let point = window.convertPoint(toScreen: event.locationInWindow)
+        let screenFrame = screen.frame
+        let visibleFrame = screen.visibleFrame
+        let bottomGap = max(0, visibleFrame.minY - screenFrame.minY)
+        let leftGap = max(0, visibleFrame.minX - screenFrame.minX)
+        let rightGap = max(0, screenFrame.maxX - visibleFrame.maxX)
+        let detectedDockGap = max(bottomGap, leftGap, rightGap)
+        let edge: DockEdge
+
+        if detectedDockGap > 4 {
+            if leftGap == detectedDockGap {
+                edge = .left
+            } else if rightGap == detectedDockGap {
+                edge = .right
+            } else {
+                edge = .bottom
+            }
+        } else {
+            let orientation = UserDefaults.standard
+                .persistentDomain(forName: "com.apple.dock")?["orientation"] as? String
+            edge = DockEdge(rawValue: orientation ?? "bottom") ?? .bottom
+        }
+
+        // Switch to the system dragging window while the icon is still fully
+        // above the Dock. Waiting until the pointer itself enters the Dock lets
+        // the page clipping boundary hide the lower half of the proxy first.
+        let activationMargin = max(104, iconSize / 2 + 64)
+        switch edge {
+        case .bottom:
+            let boundary = bottomGap > 4
+                ? visibleFrame.minY + activationMargin
+                : screenFrame.minY + activationMargin
+            return point.y <= boundary
+        case .left:
+            let boundary = leftGap > 4
+                ? visibleFrame.minX + activationMargin
+                : screenFrame.minX + activationMargin
+            return point.x <= boundary
+        case .right:
+            let boundary = rightGap > 4
+                ? visibleFrame.maxX - activationMargin
+                : screenFrame.maxX - activationMargin
+            return point.x >= boundary
+        }
+    }
+
+    private enum DockEdge: String {
+        case bottom
+        case left
+        case right
     }
 
     fileprivate func endDragging(
@@ -572,7 +851,10 @@ final class LaunchpadPagingView: NSView {
         let targetID = shouldMerge
             ? mergeTargetID
             : proposedReorderTargetID ?? mergeTargetID
-        let hasDropAction = targetID != nil
+        let destinationIndex = shouldMerge
+            ? nil
+            : dropDestinationIndex(at: event.locationInWindow)
+        let hasDropAction = targetID != nil || destinationIndex != nil
 
         cancelDragScheduling()
         hoveredTile?.setMergeHighlighted(false)
@@ -595,18 +877,55 @@ final class LaunchpadPagingView: NSView {
         proposedReorderTargetID = nil
         isShowingReorderPreview = false
 
-        guard let targetID, sourceID != targetID else { return }
-        if hasDropAction {
-            tile.alphaValue = 0
-        }
+        guard hasDropAction else { return }
+        tile.alphaValue = 0
 
         DispatchQueue.main.async { [weak self] in
-            if shouldMerge {
+            if shouldMerge, let targetID, sourceID != targetID {
                 self?.mergeAction?(sourceID, targetID)
-            } else {
+            } else if let destinationIndex {
+                self?.moveToIndexAction?(sourceID, destinationIndex)
+            } else if let targetID, sourceID != targetID {
                 self?.moveAction?(sourceID, targetID)
+            } else {
+                tile.alphaValue = 1
             }
         }
+    }
+
+    private func dropDestinationIndex(at locationInWindow: CGPoint) -> Int? {
+        let pageIndex = nearestPage()
+        guard let page = documentView.subviews
+            .compactMap({ $0 as? LaunchpadPageView })
+            .first(where: { $0.pageIndex == pageIndex })
+        else { return nil }
+
+        let point = page.convert(locationInWindow, from: nil)
+        let metrics = LaunchpadGridMetrics(
+            size: bounds.size,
+            columnCount: columnCount,
+            rowCount: rowCount,
+            horizontalInset: horizontalInset,
+            showsPageIndicator: showsPageIndicator
+        )
+        var closestSlot = 0
+        var closestDistance = CGFloat.greatestFiniteMagnitude
+
+        for row in 0..<rowCount {
+            for column in 0..<columnCount {
+                let slot = row * columnCount + column
+                let center = metrics.slotCenter(row: row, column: column)
+                let distance = hypot(point.x - center.x, point.y - center.y)
+                if distance < closestDistance {
+                    closestDistance = distance
+                    closestSlot = slot
+                }
+            }
+        }
+
+        let pageCapacity = columnCount * rowCount
+        let absoluteIndex = pageIndex * pageCapacity + closestSlot
+        return min(absoluteIndex, pages.flatMap { $0 }.count)
     }
 
     private func positionDraggingTile() {
@@ -754,7 +1073,7 @@ final class LaunchpadPagingView: NSView {
         }
 
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = animated ? 0.17 : 0
+            context.duration = animated && !reduceMotion ? LaunchpadMotion.standard : 0
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             for tile in dragPageTiles where tile !== source {
                 guard let destinationIndex = previewOrder.firstIndex(where: { $0 === tile }),
@@ -774,6 +1093,7 @@ final class LaunchpadPagingView: NSView {
         hoverWorkItem?.cancel()
         hoverWorkItem = nil
         hoveredTile?.setMergeHighlighted(false)
+        setDragProxyMergeState(false)
         hoveredTile = target
         hoverBecameMergeTarget = false
 
@@ -790,10 +1110,14 @@ final class LaunchpadPagingView: NSView {
                   self.hoveredTile === target
             else { return }
             self.hoverBecameMergeTarget = true
-            target.setMergeHighlighted(true)
+            target.setMergeHighlighted(true, merging: source.item)
+            self.setDragProxyMergeState(true)
         }
         hoverWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.52, execute: workItem)
+        // Existing folders react quickly; creating a new folder from two apps
+        // keeps a slightly longer confirmation pause to avoid accidental merges.
+        let hoverDelay: TimeInterval = target.item.folder == nil ? 0.32 : 0.1
+        DispatchQueue.main.asyncAfter(deadline: .now() + hoverDelay, execute: workItem)
     }
 
     private func distance(from point: CGPoint, to frame: CGRect) -> CGFloat {
@@ -817,15 +1141,25 @@ final class LaunchpadPagingView: NSView {
         guard let destination else {
             edgePageWorkItem?.cancel()
             edgePageWorkItem = nil
+            scheduledEdgePageDestination = nil
             return
         }
-        guard edgePageWorkItem == nil else { return }
+        guard !isSnapping else { return }
+        if scheduledEdgePageDestination == destination,
+           edgePageWorkItem != nil {
+            return
+        }
+
+        edgePageWorkItem?.cancel()
+        scheduledEdgePageDestination = destination
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.draggingTile != nil else { return }
             self.edgePageWorkItem = nil
+            self.scheduledEdgePageDestination = nil
             self.hoverWorkItem?.cancel()
             self.hoveredTile?.setMergeHighlighted(false)
+            self.setDragProxyMergeState(false)
             self.hoveredTile = nil
             self.hoverBecameMergeTarget = false
             self.cancelPendingReorder()
@@ -837,10 +1171,14 @@ final class LaunchpadPagingView: NSView {
                     showsPreview: false
                 )
             }
+            NSHapticFeedbackManager.defaultPerformer.perform(
+                .alignment,
+                performanceTime: .now
+            )
             self.animate(to: destination)
         }
         edgePageWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.58, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.48, execute: workItem)
     }
 
     private func cancelDragScheduling() {
@@ -849,6 +1187,27 @@ final class LaunchpadPagingView: NSView {
         cancelPendingReorder()
         edgePageWorkItem?.cancel()
         edgePageWorkItem = nil
+        scheduledEdgePageDestination = nil
+    }
+
+    private func setDragProxyMergeState(_ merging: Bool) {
+        guard let proxy = dragProxy,
+              let layer = proxy.layer
+        else { return }
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(reduceMotion ? 0 : (merging ? 0.16 : 0.12))
+        CATransaction.setAnimationTimingFunction(
+            CAMediaTimingFunction(name: .easeOut)
+        )
+        layer.opacity = merging ? 0.2 : 1
+        layer.setAffineTransform(
+            CGAffineTransform(
+                scaleX: merging ? 0.42 : 1.06,
+                y: merging ? 0.42 : 1.06
+            )
+        )
+        CATransaction.commit()
     }
 
     private func rebuildPages() {
@@ -878,10 +1237,14 @@ final class LaunchpadPagingView: NSView {
             columnCount: columnCount,
             rowCount: rowCount,
             horizontalInset: horizontalInset,
-            showsPageIndicator: pages.count > 1
+            showsPageIndicator: showsPageIndicator
         )
 
         for (pageIndex, apps) in pages.enumerated() {
+            let visibleRowCount = max(
+                1,
+                min(rowCount, Int(ceil(Double(apps.count) / Double(columnCount))))
+            )
             let pageView = LaunchpadPageView()
             pageView.frame = NSRect(
                 x: CGFloat(pageIndex) * bounds.width,
@@ -899,14 +1262,28 @@ final class LaunchpadPagingView: NSView {
                 let column = itemIndex % columnCount
                 guard row < rowCount else { continue }
 
-                let origin = metrics.tileOrigin(row: row, column: column)
+                let rowStartIndex = row * columnCount
+                let itemCountInRow = min(
+                    columnCount,
+                    max(0, apps.count - rowStartIndex)
+                )
+                let origin = centersContent
+                    ? metrics.centeredTileOrigin(
+                        row: row,
+                        column: column,
+                        itemCountInRow: itemCountInRow,
+                        visibleRowCount: visibleRowCount
+                    )
+                    : metrics.tileOrigin(row: row, column: column)
                 let tile = LaunchpadItemTileView(
                     item: item,
                     style: metrics.tileStyle,
+                    reduceMotion: reduceMotion,
+                    increasedContrast: increasedContrast,
                     openAction: { [weak self] app in self?.openAction?(app) },
                     revealAction: { [weak self] app in self?.revealAction?(app) },
-                    openFolderAction: { [weak self] folderID in
-                        self?.openFolderAction?(folderID)
+                    openFolderAction: { [weak self] folderID, origin in
+                        self?.openFolderAction?(folderID, origin)
                     }
                 )
                 tile.dragOwner = self
@@ -917,6 +1294,8 @@ final class LaunchpadPagingView: NSView {
             documentView.addSubview(pageView)
         }
 
+        setKeyboardSelection(keyboardSelectedItemID)
+
         scrollView.contentView.setBoundsOrigin(
             NSPoint(x: CGFloat(currentPage) * bounds.width, y: 0)
         )
@@ -926,6 +1305,17 @@ final class LaunchpadPagingView: NSView {
         pendingPage = currentPage
         scrollVelocity = 0
         displayLink?.isPaused = true
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        context == .outsideApplication ? [.copy, .link] : .copy
+    }
+
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool {
+        true
     }
 }
 
@@ -963,11 +1353,14 @@ private final class LaunchpadPageView: NSView {
 private final class LaunchpadItemTileView: NSView {
     let item: LaunchpadItem
     private let style: LaunchpadTileStyle
+    private let reduceMotion: Bool
+    private let increasedContrast: Bool
     weak var dragOwner: LaunchpadPagingView?
     private let openAction: (InstalledApp) -> Void
     private let revealAction: (InstalledApp) -> Void
-    private let openFolderAction: (String) -> Void
+    private let openFolderAction: (String, CGPoint) -> Void
     private let iconContainer = NSView()
+    private let keyboardFocusRing = NSView()
     private let imageView = NSImageView()
     private let folderBackground = NSView()
     private var folderPreviewViews: [NSImageView] = []
@@ -975,18 +1368,24 @@ private final class LaunchpadItemTileView: NSView {
     private var mouseDownPoint = CGPoint.zero
     private var isDraggingItem = false
     private var isTrackingMouse = false
+    private var isShowingTemporaryFolderPreview = false
+    private var previewTransitionGeneration = 0
 
     override var isFlipped: Bool { true }
 
     init(
         item: LaunchpadItem,
         style: LaunchpadTileStyle,
+        reduceMotion: Bool,
+        increasedContrast: Bool,
         openAction: @escaping (InstalledApp) -> Void,
         revealAction: @escaping (InstalledApp) -> Void,
-        openFolderAction: @escaping (String) -> Void
+        openFolderAction: @escaping (String, CGPoint) -> Void
     ) {
         self.item = item
         self.style = style
+        self.reduceMotion = reduceMotion
+        self.increasedContrast = increasedContrast
         self.openAction = openAction
         self.revealAction = revealAction
         self.openFolderAction = openFolderAction
@@ -998,6 +1397,26 @@ private final class LaunchpadItemTileView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
         setAccessibilityLabel(item.name)
+        setAccessibilityIdentifier(item.id)
+        switch item.content {
+        case .app:
+            setAccessibilityValue("应用")
+            setAccessibilityHelp("按下以打开应用；也可以拖动调整位置")
+        case .folder(let folder):
+            setAccessibilityValue("文件夹，包含 \(folder.apps.count) 个应用")
+            setAccessibilityHelp("按下以打开文件夹；也可以拖动调整位置")
+        }
+
+        keyboardFocusRing.wantsLayer = true
+        keyboardFocusRing.isHidden = true
+        keyboardFocusRing.layer?.backgroundColor = NSColor.white.withAlphaComponent(
+            increasedContrast ? 0.18 : 0.1
+        ).cgColor
+        keyboardFocusRing.layer?.borderColor = NSColor.white.withAlphaComponent(
+            increasedContrast ? 1 : 0.7
+        ).cgColor
+        keyboardFocusRing.layer?.borderWidth = increasedContrast ? 2.5 : 1.5
+        addSubview(keyboardFocusRing)
 
         iconContainer.wantsLayer = true
         iconContainer.layer?.masksToBounds = false
@@ -1012,9 +1431,13 @@ private final class LaunchpadItemTileView: NSView {
         iconContainer.addSubview(imageView)
 
         folderBackground.wantsLayer = true
-        folderBackground.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
-        folderBackground.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
-        folderBackground.layer?.borderWidth = 1
+        folderBackground.layer?.backgroundColor = NSColor.white.withAlphaComponent(
+            increasedContrast ? 0.28 : 0.18
+        ).cgColor
+        folderBackground.layer?.borderColor = NSColor.white.withAlphaComponent(
+            increasedContrast ? 0.72 : 0.16
+        ).cgColor
+        folderBackground.layer?.borderWidth = increasedContrast ? 2 : 1
         folderBackground.layer?.cornerRadius = style.iconSize * 0.21
         folderBackground.layer?.shadowColor = NSColor.black.cgColor
         folderBackground.layer?.shadowOpacity = 0.25
@@ -1046,6 +1469,13 @@ private final class LaunchpadItemTileView: NSView {
     override func layout() {
         super.layout()
         let iconX = (bounds.width - style.iconSize) / 2
+        keyboardFocusRing.frame = NSRect(
+            x: iconX - 7,
+            y: -7,
+            width: style.iconSize + 14,
+            height: style.iconSize + 14
+        )
+        keyboardFocusRing.layer?.cornerRadius = (style.iconSize + 14) * 0.23
         iconContainer.frame = NSRect(
             x: iconX,
             y: 0,
@@ -1053,20 +1483,46 @@ private final class LaunchpadItemTileView: NSView {
             height: style.iconSize
         )
         imageView.frame = iconContainer.bounds
-        folderBackground.frame = iconContainer.bounds
+        // Application artwork commonly contains a small transparent safe area,
+        // while our folder background is an edge-to-edge shape. Give folders
+        // the same optical footprint as app icons instead of making them look
+        // larger even though both use the same nominal icon size.
+        let folderSize = style.iconSize * 0.9
+        let folderInset = (style.iconSize - folderSize) / 2
+        let folderFrame = CGRect(
+            x: folderInset,
+            y: folderInset,
+            width: folderSize,
+            height: folderSize
+        )
+        folderBackground.frame = folderFrame
 
-        let previewPadding = style.iconSize * 0.105
-        let previewGap = style.iconSize * 0.085
-        let previewSize = (style.iconSize - previewPadding * 2 - previewGap) / 2
-        let secondPreviewOrigin = previewPadding + previewSize + previewGap
-        let positions = [
-            CGPoint(x: previewPadding, y: previewPadding),
-            CGPoint(x: secondPreviewOrigin, y: previewPadding),
-            CGPoint(x: previewPadding, y: secondPreviewOrigin),
-            CGPoint(x: secondPreviewOrigin, y: secondPreviewOrigin)
-        ]
+        let previewColumnCount = 3
+        let previewPadding = folderSize * 0.12
+        let previewGap = folderSize * 0.045
+        let previewSize = (
+            folderSize
+                - previewPadding * 2
+                - previewGap * CGFloat(previewColumnCount - 1)
+        ) / CGFloat(previewColumnCount)
+
         for (index, preview) in folderPreviewViews.enumerated() {
-            preview.frame = NSRect(origin: positions[index], size: CGSize(width: previewSize, height: previewSize))
+            let column = index % previewColumnCount
+            let row = index / previewColumnCount
+            let origin = CGPoint(
+                // Preview views are children of folderBackground, so their
+                // coordinates are local to that view rather than iconContainer.
+                x: previewPadding
+                    + CGFloat(column) * (previewSize + previewGap),
+                y: folderSize
+                    - previewPadding
+                    - previewSize
+                    - CGFloat(row) * (previewSize + previewGap)
+            )
+            preview.frame = NSRect(
+                origin: origin,
+                size: CGSize(width: previewSize, height: previewSize)
+            )
         }
         titleField.frame = NSRect(
             x: 0,
@@ -1083,6 +1539,10 @@ private final class LaunchpadItemTileView: NSView {
             width: tileFrame.width,
             height: min(tileFrame.height, style.iconSize * 1.3)
         )
+    }
+
+    fileprivate var dockDraggingIconSize: CGFloat {
+        style.iconSize
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -1121,7 +1581,9 @@ private final class LaunchpadItemTileView: NSView {
 
             switch trackedEvent.type {
             case .leftMouseDragged:
-                self.handleMouseDragged(trackedEvent)
+                if self.handleMouseDragged(trackedEvent) {
+                    stop.pointee = true
+                }
             case .leftMouseUp:
                 self.handleMouseUp(trackedEvent)
                 stop.pointee = true
@@ -1134,7 +1596,7 @@ private final class LaunchpadItemTileView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard !isTrackingMouse else { return }
-        handleMouseDragged(event)
+        _ = handleMouseDragged(event)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -1142,7 +1604,8 @@ private final class LaunchpadItemTileView: NSView {
         handleMouseUp(event)
     }
 
-    private func handleMouseDragged(_ event: NSEvent) {
+    @discardableResult
+    private func handleMouseDragged(_ event: NSEvent) -> Bool {
         let point = convert(event.locationInWindow, from: nil)
         if !isDraggingItem,
            hypot(point.x - mouseDownPoint.x, point.y - mouseDownPoint.y) > 6 {
@@ -1151,8 +1614,14 @@ private final class LaunchpadItemTileView: NSView {
         }
 
         if isDraggingItem {
-            dragOwner?.updateDragging(self, with: event)
+            let startedSystemDrag = dragOwner?.updateDragging(self, with: event) == true
+            if startedSystemDrag {
+                isDraggingItem = false
+                animatePressed(false)
+                return true
+            }
         }
+        return false
     }
 
     private func handleMouseUp(_ event: NSEvent) {
@@ -1199,26 +1668,65 @@ private final class LaunchpadItemTileView: NSView {
         revealAction(app)
     }
 
-    private func activateItem() {
+    fileprivate func activateItem() {
         switch item.content {
         case .app(let app):
             openAction(app)
         case .folder(let folder):
-            openFolderAction(folder.id)
+            let localCenter = CGPoint(
+                x: bounds.midX,
+                y: style.iconSize / 2
+            )
+            var rootPoint = convert(localCenter, to: nil)
+            if let contentView = window?.contentView {
+                // Convert directly between the two views. Going through the
+                // window base coordinate system can flip Y twice when the
+                // NSHostingView and the AppKit grid use different orientations.
+                let contentPoint = contentView.convert(localCenter, from: self)
+                rootPoint = CGPoint(
+                    x: contentPoint.x,
+                    y: contentView.isFlipped
+                        ? contentPoint.y
+                        : contentView.bounds.height - contentPoint.y
+                )
+            }
+            openFolderAction(folder.id, rootPoint)
         }
+    }
+
+    func setKeyboardFocused(_ focused: Bool) {
+        let shouldHide = !focused
+        guard keyboardFocusRing.isHidden != shouldHide else { return }
+        keyboardFocusRing.isHidden = shouldHide
+        setAccessibilityFocused(focused)
     }
 
     func setDragging(_ dragging: Bool) {
         alphaValue = dragging ? 0.94 : 1
         layer?.zPosition = dragging ? 100 : 0
-        setIconScale(dragging ? 1.08 : 1, duration: 0.14)
+        setIconScale(dragging ? 1.08 : 1, duration: reduceMotion ? 0 : 0.14)
     }
 
-    func setMergeHighlighted(_ highlighted: Bool) {
-        layer?.backgroundColor = highlighted
-            ? NSColor.white.withAlphaComponent(0.12).cgColor
-            : NSColor.clear.cgColor
-        setIconScale(highlighted ? 1.13 : 1, duration: 0.18)
+    func setMergeHighlighted(
+        _ highlighted: Bool,
+        merging sourceItem: LaunchpadItem? = nil
+    ) {
+        // Native Launchpad confirms a folder drop by gently breathing the
+        // target icon. Do not paint the entire tile: that produces a large
+        // rectangular glow behind the folder and its title.
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        if highlighted,
+           item.app != nil,
+           let sourceApp = sourceItem?.app {
+            showTemporaryFolderPreview(with: sourceApp)
+        } else if !highlighted {
+            hideTemporaryFolderPreview()
+        }
+
+        let usesFolderVisual = item.folder != nil || isShowingTemporaryFolderPreview
+        let highlightedScale: CGFloat = usesFolderVisual ? 1.045 : 1.06
+        setMergeHoverScale(highlighted ? highlightedScale : 1, entering: highlighted)
     }
 
     private func configureIcon() {
@@ -1231,18 +1739,101 @@ private final class LaunchpadItemTileView: NSView {
         case .folder(let folder):
             imageView.isHidden = true
             folderBackground.isHidden = false
-            for app in folder.apps.prefix(4) {
-                let preview = NSImageView()
-                preview.image = app.icon
-                preview.imageScaling = .scaleProportionallyUpOrDown
-                folderBackground.addSubview(preview)
-                folderPreviewViews.append(preview)
-            }
+            setFolderPreviewApps(Array(folder.apps.prefix(9)))
+        }
+    }
+
+    private func setFolderPreviewApps(_ apps: [InstalledApp]) {
+        folderPreviewViews.forEach { $0.removeFromSuperview() }
+        folderPreviewViews.removeAll(keepingCapacity: true)
+
+        for app in apps.prefix(9) {
+            let preview = NSImageView()
+            preview.image = app.icon
+            preview.imageScaling = .scaleProportionallyUpOrDown
+            folderBackground.addSubview(preview)
+            folderPreviewViews.append(preview)
+        }
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+
+    private func showTemporaryFolderPreview(with sourceApp: InstalledApp) {
+        guard !isShowingTemporaryFolderPreview,
+              let targetApp = item.app,
+              sourceApp.id != targetApp.id
+        else { return }
+
+        previewTransitionGeneration += 1
+        let generation = previewTransitionGeneration
+        isShowingTemporaryFolderPreview = true
+        setFolderPreviewApps([targetApp, sourceApp])
+        titleField.stringValue = "文件夹"
+
+        folderBackground.isHidden = false
+        folderBackground.alphaValue = 0
+        imageView.isHidden = false
+        imageView.alphaValue = 1
+
+        if reduceMotion {
+            folderBackground.alphaValue = 1
+            imageView.isHidden = true
+            imageView.alphaValue = 1
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = LaunchpadMotion.quick
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            folderBackground.animator().alphaValue = 1
+            imageView.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self,
+                  self.previewTransitionGeneration == generation,
+                  self.isShowingTemporaryFolderPreview
+            else { return }
+            self.imageView.isHidden = true
+            self.imageView.alphaValue = 1
+        }
+    }
+
+    private func hideTemporaryFolderPreview() {
+        guard isShowingTemporaryFolderPreview else { return }
+
+        previewTransitionGeneration += 1
+        let generation = previewTransitionGeneration
+        isShowingTemporaryFolderPreview = false
+        titleField.stringValue = item.name
+        imageView.isHidden = false
+        imageView.alphaValue = 0
+
+        if reduceMotion {
+            folderBackground.isHidden = true
+            folderBackground.alphaValue = 1
+            imageView.alphaValue = 1
+            setFolderPreviewApps([])
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = LaunchpadMotion.quick
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            folderBackground.animator().alphaValue = 0
+            imageView.animator().alphaValue = 1
+        } completionHandler: { [weak self] in
+            guard let self,
+                  self.previewTransitionGeneration == generation,
+                  !self.isShowingTemporaryFolderPreview
+            else { return }
+            self.folderBackground.isHidden = true
+            self.folderBackground.alphaValue = 1
+            self.setFolderPreviewApps([])
         }
     }
 
     private func setIconScale(_ scale: CGFloat, duration: CFTimeInterval) {
         guard let layer = iconContainer.layer else { return }
+        layer.removeAnimation(forKey: "mergeHoverScale")
         CATransaction.begin()
         CATransaction.setAnimationDuration(duration)
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
@@ -1250,9 +1841,49 @@ private final class LaunchpadItemTileView: NSView {
         CATransaction.commit()
     }
 
+    private func setMergeHoverScale(_ scale: CGFloat, entering: Bool) {
+        guard let layer = iconContainer.layer else { return }
+
+        if reduceMotion {
+            layer.removeAnimation(forKey: "mergeHoverScale")
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.setAffineTransform(CGAffineTransform(scaleX: scale, y: scale))
+            CATransaction.commit()
+            return
+        }
+
+        let presentedScale = (
+            layer.presentation()?.value(forKeyPath: "transform.scale.x") as? NSNumber
+        )?.doubleValue
+        let currentScale = CGFloat(presentedScale ?? Double(
+            layer.value(forKeyPath: "transform.scale.x") as? CGFloat ?? 1
+        ))
+
+        layer.removeAnimation(forKey: "mergeHoverScale")
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.setAffineTransform(CGAffineTransform(scaleX: scale, y: scale))
+        CATransaction.commit()
+
+        let spring = CASpringAnimation(keyPath: "transform.scale")
+        spring.fromValue = currentScale
+        spring.toValue = scale
+        spring.mass = 0.72
+        spring.stiffness = entering ? 390 : 330
+        spring.damping = entering ? 25 : 27
+        spring.initialVelocity = entering ? 0.12 : 0
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: "mergeHoverScale")
+    }
+
     private func animatePressed(_ pressed: Bool) {
+        if reduceMotion {
+            alphaValue = pressed ? 0.82 : 1
+            return
+        }
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
+            context.duration = LaunchpadMotion.quick
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             animator().alphaValue = pressed ? 0.82 : 1
         }

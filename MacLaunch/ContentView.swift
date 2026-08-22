@@ -1,17 +1,20 @@
 //
 //  ContentView.swift
-//  MacLaunch
+//  LaunchEase
 //
 //  Created by 随便 on 2026/8/14.
 //
 
 import AppKit
 import Combine
+import Darwin
 import SwiftUI
 
 @MainActor
 final class ScreenDockMetrics: NSObject, ObservableObject {
     @Published private(set) var bottomInset: CGFloat = 0
+    @Published private(set) var leftInset: CGFloat = 0
+    @Published private(set) var rightInset: CGFloat = 0
     private var pendingRefreshes: [DispatchWorkItem] = []
 
     override init() {
@@ -28,6 +31,12 @@ final class ScreenDockMetrics: NSObject, ObservableObject {
             self,
             selector: #selector(screenMetricsDidChange(_:)),
             name: Notification.Name("com.apple.dock.prefchanged"),
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenMetricsDidChange(_:)),
+            name: .launcherScreenDidChange,
             object: nil
         )
     }
@@ -55,13 +64,26 @@ final class ScreenDockMetrics: NSObject, ObservableObject {
     }
 
     func refresh() {
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+        guard let screen = LauncherWindowController.shared.activeScreen
+            ?? NSScreen.screenContainingMouse
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        else {
             bottomInset = 0
+            leftInset = 0
+            rightInset = 0
             return
         }
 
         bottomInset = max(0, screen.visibleFrame.minY - screen.frame.minY)
+        leftInset = max(0, screen.visibleFrame.minX - screen.frame.minX)
+        rightInset = max(0, screen.frame.maxX - screen.visibleFrame.maxX)
     }
+}
+
+private enum LauncherFocusedControl: Hashable {
+    case search
+    case settings
 }
 
 struct InstalledApp: Identifiable {
@@ -74,51 +96,206 @@ struct InstalledApp: Identifiable {
     }
 }
 
+private struct ScannedApplicationDescriptor: Sendable {
+    let url: URL
+    let name: String
+    let iconCacheKey: String
+}
+
+private final class ApplicationFolderWatcher: @unchecked Sendable {
+    private let queue = DispatchQueue(
+        label: "com.launch.MacLaunch.application-folder-watcher",
+        qos: .utility
+    )
+    private var sources: [DispatchSourceFileSystemObject] = []
+
+    func watch(
+        _ folders: [URL],
+        changeHandler: @escaping @Sendable () -> Void
+    ) {
+        stop()
+
+        var watchedPaths = Set<String>()
+        for folder in folders {
+            let path = folder.resolvingSymlinksInPath().standardizedFileURL.path
+            guard watchedPaths.insert(path).inserted else { continue }
+
+            let descriptor = Darwin.open(path, O_EVTONLY)
+            guard descriptor >= 0 else { continue }
+
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .delete, .rename, .extend, .link, .revoke],
+                queue: queue
+            )
+            source.setEventHandler(handler: changeHandler)
+            source.setCancelHandler {
+                Darwin.close(descriptor)
+            }
+            sources.append(source)
+            source.resume()
+        }
+    }
+
+    func stop() {
+        let activeSources = sources
+        sources.removeAll()
+        activeSources.forEach { $0.cancel() }
+    }
+
+    deinit {
+        stop()
+    }
+}
+
 @MainActor
 final class AppLibrary: ObservableObject {
     @Published private(set) var apps: [InstalledApp] = []
     @Published private(set) var isLoading = false
     private var scanFolders: [URL]
+    private let iconCache = NSCache<NSString, NSImage>()
+    private let folderWatcher = ApplicationFolderWatcher()
+    private var reloadTask: Task<Void, Never>?
+    private var watcherReloadTask: Task<Void, Never>?
+    private var reloadGeneration = 0
 
     init(folders: [URL]) {
         scanFolders = folders
+        iconCache.countLimit = 512
+        configureFolderWatcher()
         reload()
+    }
+
+    deinit {
+        reloadTask?.cancel()
+        watcherReloadTask?.cancel()
     }
 
     func reload(folders: [URL]? = nil) {
         if let folders {
             scanFolders = folders
+            configureFolderWatcher()
         }
-        isLoading = true
+        reloadTask?.cancel()
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        let foldersToScan = scanFolders
 
+        // Keep the current page visible during a refresh. Only the first scan
+        // needs the full-page loading state.
+        if apps.isEmpty {
+            isLoading = true
+        }
+
+        reloadTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let descriptors = Self.scanApplicationDescriptors(in: foldersToScan)
+            guard !Task.isCancelled else { return }
+            await self?.apply(descriptors, generation: generation)
+        }
+    }
+
+    private func configureFolderWatcher() {
+        folderWatcher.watch(scanFolders) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.scheduleWatchedFolderReload()
+            }
+        }
+    }
+
+    private func scheduleWatchedFolderReload() {
+        watcherReloadTask?.cancel()
+        watcherReloadTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 450_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+
+            // Directory replacement or rename invalidates its vnode source.
+            // Rebuild the watchers before rescanning so subsequent changes are
+            // still observed.
+            self.configureFolderWatcher()
+            self.reload()
+        }
+    }
+
+    private func apply(
+        _ descriptors: [ScannedApplicationDescriptor],
+        generation: Int
+    ) async {
         var discoveredApps: [InstalledApp] = []
-        var discoveredPaths = Set<String>()
+        discoveredApps.reserveCapacity(descriptors.count)
 
-        for url in Self.applicationURLs(in: scanFolders) {
-            let resolvedURL = url.resolvingSymlinksInPath().standardizedFileURL
-            let path = resolvedURL.path
-            guard discoveredPaths.insert(path).inserted else {
-                continue
+        for (index, descriptor) in descriptors.enumerated() {
+            guard !Task.isCancelled,
+                  generation == reloadGeneration
+            else { return }
+
+            let cacheKey = descriptor.iconCacheKey as NSString
+            let icon: NSImage
+            if let cachedIcon = iconCache.object(forKey: cacheKey) {
+                icon = cachedIcon
+            } else {
+                icon = NSWorkspace.shared.icon(forFile: descriptor.url.path)
+                icon.size = NSSize(width: 256, height: 256)
+                iconCache.setObject(icon, forKey: cacheKey)
             }
 
-            let bundle = Bundle(url: resolvedURL)
-            let name = Self.localizedApplicationName(for: resolvedURL, bundle: bundle)
-
-            let icon = NSWorkspace.shared.icon(forFile: path)
-            icon.size = NSSize(width: 256, height: 256)
-
             discoveredApps.append(
-                InstalledApp(name: name, url: resolvedURL, icon: icon)
+                InstalledApp(
+                    name: descriptor.name,
+                    url: descriptor.url,
+                    icon: icon
+                )
             )
+
+            // Icon creation is AppKit work and stays on the main actor, but
+            // yielding in small batches keeps animation and input responsive.
+            if index.isMultiple(of: 8) {
+                await Task.yield()
+            }
         }
 
+        guard generation == reloadGeneration else { return }
         apps = discoveredApps.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
         isLoading = false
     }
 
-    private static func applicationURLs(in folders: [URL]) -> [URL] {
+    nonisolated private static func scanApplicationDescriptors(
+        in folders: [URL]
+    ) -> [ScannedApplicationDescriptor] {
+        var descriptors: [ScannedApplicationDescriptor] = []
+        var discoveredPaths = Set<String>()
+
+        for url in applicationURLs(in: folders) {
+            guard !Task.isCancelled else { return [] }
+
+            let resolvedURL = url.resolvingSymlinksInPath().standardizedFileURL
+            let path = resolvedURL.path
+            guard discoveredPaths.insert(path).inserted else { continue }
+
+            let bundle = Bundle(url: resolvedURL)
+            let name = localizedApplicationName(for: resolvedURL, bundle: bundle)
+            let modificationDate = (
+                try? resolvedURL.resourceValues(forKeys: [.contentModificationDateKey])
+            )?.contentModificationDate?.timeIntervalSinceReferenceDate ?? 0
+
+            descriptors.append(
+                ScannedApplicationDescriptor(
+                    url: resolvedURL,
+                    name: name,
+                    iconCacheKey: "\(path)|\(modificationDate)"
+                )
+            )
+        }
+
+        return descriptors
+    }
+
+    nonisolated private static func applicationURLs(in folders: [URL]) -> [URL] {
         let resourceKeys: Set<URLResourceKey> = [
             .isDirectoryKey,
             .isPackageKey
@@ -128,6 +305,7 @@ final class AppLibrary: ObservableObject {
         var applications: [URL] = []
 
         while let folder = pendingFolders.popLast() {
+            guard !Task.isCancelled else { return [] }
             let resolvedFolder = folder.resolvingSymlinksInPath().standardizedFileURL
             guard visitedFolders.insert(resolvedFolder.path).inserted,
                   FileManager.default.fileExists(atPath: resolvedFolder.path),
@@ -170,7 +348,10 @@ final class AppLibrary: ObservableObject {
         return applications
     }
 
-    private static func localizedApplicationName(for url: URL, bundle: Bundle?) -> String {
+    nonisolated private static func localizedApplicationName(
+        for url: URL,
+        bundle: Bundle?
+    ) -> String {
         if let bundle {
             if let loctableURL = bundle.url(
                 forResource: "InfoPlist",
@@ -238,7 +419,9 @@ final class AppLibrary: ObservableObject {
             ?? url.deletingPathExtension().lastPathComponent
     }
 
-    private static func applicationName(in localizedInfo: [String: Any]) -> String? {
+    nonisolated private static func applicationName(
+        in localizedInfo: [String: Any]
+    ) -> String? {
         if let displayName = localizedInfo["CFBundleDisplayName"] as? String,
            !displayName.isEmpty {
             return displayName
@@ -252,7 +435,9 @@ final class AppLibrary: ObservableObject {
         return nil
     }
 
-    private static func preferredLocalizations(from availableLocalizations: [String]) -> [String] {
+    nonisolated private static func preferredLocalizations(
+        from availableLocalizations: [String]
+    ) -> [String] {
         var result: [String] = []
 
         func append(_ localization: String?) {
@@ -341,6 +526,9 @@ final class AppLibrary: ObservableObject {
 }
 
 struct ContentView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
     @StateObject private var settings: LauncherSettings
     @StateObject private var library: AppLibrary
     @StateObject private var layoutStore: LaunchpadLayoutStore
@@ -350,8 +538,12 @@ struct ContentView: View {
     @State private var currentPage = 0
     @State private var showsSettings = false
     @State private var openedFolderID: String?
+    @State private var openedFolderOrigin: CGPoint?
+    @State private var isFolderPresented = false
     @State private var mainPagerFrame = CGRect.zero
-    @FocusState private var isSearchFocused: Bool
+    @State private var keyboardSelectedItemID: String?
+    @State private var keyboardActivationRequest = 0
+    @FocusState private var focusedControl: LauncherFocusedControl?
 
     init() {
         let settings = LauncherSettings()
@@ -370,14 +562,36 @@ struct ContentView: View {
             return layoutStore.items
         }
 
-        return layoutStore.items.filter { item in
-            if item.name.localizedCaseInsensitiveContains(query) {
-                return true
+        var results: [LaunchpadItem] = []
+        var insertedIDs = Set<String>()
+        for item in layoutStore.items {
+            if let app = item.app {
+                if matchesSearch(app.name, query: query),
+                   insertedIDs.insert(app.id).inserted {
+                    results.append(LaunchpadItem(content: .app(app)))
+                }
+                continue
             }
-            return item.folder?.apps.contains {
-                $0.name.localizedCaseInsensitiveContains(query)
-            } == true
+
+            guard let folder = item.folder else { continue }
+            if matchesSearch(folder.name, query: query) {
+                if insertedIDs.insert(folder.id).inserted {
+                    results.append(item)
+                }
+                continue
+            }
+
+            for app in folder.apps where matchesSearch(app.name, query: query) {
+                if insertedIDs.insert(app.id).inserted {
+                    results.append(LaunchpadItem(content: .app(app)))
+                }
+            }
         }
+        return results
+    }
+
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
@@ -386,6 +600,7 @@ struct ContentView: View {
                 DesktopWallpaperView()
                     .contentShape(Rectangle())
                     .onTapGesture(perform: dismissLauncher)
+                    .accessibilityHidden(true)
 
                 VStack(spacing: 0) {
                     searchBar
@@ -400,23 +615,28 @@ struct ContentView: View {
                         appGrid(width: geometry.size.width, height: geometry.size.height)
                     }
                 }
-                .opacity(hasAppeared ? 1 : 0)
-                .scaleEffect(hasAppeared ? 1 : 0.985)
-                .offset(y: hasAppeared ? 0 : 10)
+                .opacity(hasAppeared || reduceMotion ? 1 : 0)
+                .scaleEffect(hasAppeared || reduceMotion ? 1 : 0.985)
+                .offset(y: hasAppeared || reduceMotion ? 0 : 10)
 
                 if let openedFolderID,
                    layoutStore.folder(withID: openedFolderID) != nil {
                     FolderOverlay(
                         folderID: openedFolderID,
+                        sourceOrigin: openedFolderOrigin,
+                        isPresented: isFolderPresented,
                         layoutStore: layoutStore,
                         openAction: openAppFromFolder,
                         closeAction: closeFolder,
                         dropIndexAction: mainDropIndex
                     )
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    .transition(.opacity)
                 }
 
                 EscapeKeyMonitor(action: handleEscape)
+                    .frame(width: 0, height: 0)
+
+                LauncherKeyboardMonitor(action: handleKeyboardEvent)
                     .frame(width: 0, height: 0)
             }
         }
@@ -425,12 +645,18 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .onAppear {
             screenDockMetrics.refresh()
-            withAnimation(.easeOut(duration: 0.36)) {
+            withAnimation(
+                reduceMotion ? nil : .spring(
+                    response: LaunchpadMotion.folderResponse,
+                    dampingFraction: LaunchpadMotion.folderDamping
+                )
+            ) {
                 hasAppeared = true
             }
         }
         .onChange(of: searchText) {
             currentPage = 0
+            keyboardSelectedItemID = nil
         }
         .onChange(of: settings.applicationFolderPaths) {
             currentPage = 0
@@ -443,6 +669,17 @@ struct ContentView: View {
                 self.openedFolderID = nil
             }
         }
+        .onChange(of: layoutStore.items.map(\.id)) {
+            guard let openedFolderID,
+                  layoutStore.folder(withID: openedFolderID) == nil
+            else { return }
+            self.openedFolderID = nil
+            openedFolderOrigin = nil
+            isFolderPresented = false
+        }
+        .onChange(of: currentPage) {
+            keepKeyboardSelectionOnCurrentPage()
+        }
         .onExitCommand(perform: handleEscape)
         .onPreferenceChange(MainPagerFramePreferenceKey.self) {
             mainPagerFrame = $0
@@ -454,7 +691,7 @@ struct ContentView: View {
             searchField
 
             Button {
-                isSearchFocused = false
+                focusedControl = nil
                 showsSettings.toggle()
             } label: {
                 Image(systemName: "gearshape.fill")
@@ -474,14 +711,22 @@ struct ContentView: View {
             }
             .overlay {
                 RoundedRectangle(cornerRadius: 15, style: .continuous)
-                    .stroke(.white.opacity(0.2), lineWidth: 1)
+                    .stroke(
+                        .white.opacity(colorSchemeContrast == .increased ? 0.72 : 0.2),
+                        lineWidth: colorSchemeContrast == .increased ? 2 : 1
+                    )
             }
             .shadow(color: .black.opacity(0.2), radius: 14, y: 5)
             .help("启动台设置")
+            .accessibilityLabel("启动台设置")
+            .accessibilityHint("打开扫描目录、图标布局和备份设置")
+            .focused($focusedControl, equals: .settings)
             .popover(isPresented: $showsSettings, arrowEdge: .bottom) {
                 LauncherSettingsView(
                     settings: settings,
-                    isPresented: $showsSettings
+                    layoutStore: layoutStore,
+                    isPresented: $showsSettings,
+                    importAction: restoreBackup
                 )
             }
         }
@@ -497,12 +742,14 @@ struct ContentView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.white)
-                .focused($isSearchFocused)
+                .focused($focusedControl, equals: .search)
+                .accessibilityLabel("搜索应用")
+                .accessibilityHint("可输入应用名称、拼音或拼音首字母")
 
             if !searchText.isEmpty {
                 Button {
                     searchText = ""
-                    isSearchFocused = true
+                    focusedControl = .search
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 15, weight: .medium))
@@ -510,6 +757,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .transition(.opacity.combined(with: .scale))
+                .accessibilityLabel("清除搜索内容")
             }
         }
         .padding(.horizontal, 15)
@@ -521,10 +769,16 @@ struct ContentView: View {
         }
         .overlay {
             RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .stroke(.white.opacity(0.2), lineWidth: 1)
+                .stroke(
+                    .white.opacity(colorSchemeContrast == .increased ? 0.72 : 0.2),
+                    lineWidth: colorSchemeContrast == .increased ? 2 : 1
+                )
         }
         .shadow(color: .black.opacity(0.2), radius: 14, y: 5)
-        .animation(.easeOut(duration: 0.16), value: searchText.isEmpty)
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: LaunchpadMotion.quick),
+            value: searchText.isEmpty
+        )
     }
 
     private var loadingView: some View {
@@ -536,6 +790,8 @@ struct ContentView: View {
                 .foregroundStyle(.white.opacity(0.78))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("正在查找应用")
     }
 
     private var emptyView: some View {
@@ -552,6 +808,8 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
         .onTapGesture(perform: dismissLauncher)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("没有找到应用，请尝试其他关键词")
     }
 
     private func appGrid(width: CGFloat, height: CGFloat) -> some View {
@@ -559,20 +817,32 @@ struct ContentView: View {
         let rowCount = settings.rowCount
         let pageSize = columnCount * rowCount
         let pages = filteredItems.chunked(into: pageSize)
-        let horizontalInset = max(56, width * 0.075)
+        let usableWidth = max(
+            1,
+            width - screenDockMetrics.leftInset - screenDockMetrics.rightInset
+        )
+        let horizontalInset = max(56, usableWidth * 0.075)
+        let showsPageIndicator = !isSearching && pages.count > 1
 
         return CoreAnimationPager(
             pages: pages,
             columnCount: columnCount,
             rowCount: rowCount,
             horizontalInset: horizontalInset,
+            centersContent: isSearching,
+            showsPageIndicator: showsPageIndicator,
+            reduceMotion: reduceMotion,
+            increasedContrast: colorSchemeContrast == .increased,
             selectedPage: $currentPage,
+            keyboardSelectedItemID: $keyboardSelectedItemID,
+            keyboardActivationRequest: keyboardActivationRequest,
             openAction: library.open,
             revealAction: library.revealInFinder,
             openFolderAction: openFolder,
             moveAction: layoutStore.move,
+            moveToIndexAction: layoutStore.move,
             mergeAction: layoutStore.merge,
-            allowsEditing: searchText.isEmpty,
+            allowsEditing: !isSearching,
             dismissAction: dismissLauncher
         )
         .background {
@@ -586,7 +856,7 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if pages.count > 1 {
+            if showsPageIndicator {
                 HStack(spacing: 9) {
                     ForEach(pages.indices, id: \.self) { page in
                         Button {
@@ -594,9 +864,15 @@ struct ContentView: View {
                         } label: {
                             Circle()
                                 .fill(.white.opacity(currentPage == page ? 0.95 : 0.3))
-                                .frame(width: 8, height: 8)
+                                .frame(
+                                    width: currentPage == page && differentiateWithoutColor ? 10 : 8,
+                                    height: currentPage == page && differentiateWithoutColor ? 10 : 8
+                                )
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("第 \(page + 1) 页")
+                        .accessibilityValue(currentPage == page ? "当前页" : "")
+                        .accessibilityHint("显示这一页的应用")
                     }
                 }
                 .fixedSize()
@@ -607,6 +883,8 @@ struct ContentView: View {
         // for its shadow and enlarged icon edge, then let the grid redistribute
         // every row inside the remaining height.
         .padding(.bottom, max(32, screenDockMetrics.bottomInset + 44))
+        .padding(.leading, screenDockMetrics.leftInset)
+        .padding(.trailing, screenDockMetrics.rightInset)
         .onChange(of: pages.count) {
             let lastPage = max(0, pages.count - 1)
             currentPage = min(currentPage, lastPage)
@@ -678,35 +956,252 @@ struct ContentView: View {
     }
 
     private func dismissLauncher() {
-        isSearchFocused = false
+        focusedControl = nil
+        keyboardSelectedItemID = nil
         openedFolderID = nil
+        openedFolderOrigin = nil
+        isFolderPresented = false
         LauncherWindowController.shared.hide()
     }
 
-    private func openFolder(_ folderID: String) {
-        isSearchFocused = false
-        withAnimation(.easeOut(duration: 0.2)) {
-            openedFolderID = folderID
+    private func openFolder(_ folderID: String, origin: CGPoint) {
+        focusedControl = nil
+        openedFolderOrigin = origin
+        isFolderPresented = false
+        openedFolderID = folderID
+        DispatchQueue.main.async {
+            guard openedFolderID == folderID else { return }
+            withAnimation(
+                reduceMotion ? nil : .spring(
+                    response: LaunchpadMotion.folderResponse,
+                    dampingFraction: LaunchpadMotion.folderDamping
+                )
+            ) {
+                isFolderPresented = true
+            }
         }
     }
 
     private func closeFolder() {
-        withAnimation(.easeOut(duration: 0.18)) {
+        guard let closingFolderID = openedFolderID else { return }
+        withAnimation(
+            reduceMotion ? nil : .spring(
+                response: LaunchpadMotion.folderResponse,
+                dampingFraction: LaunchpadMotion.folderDamping
+            )
+        ) {
+            isFolderPresented = false
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + (reduceMotion ? 0 : LaunchpadMotion.folderResponse + 0.04)
+        ) {
+            guard openedFolderID == closingFolderID,
+                  !isFolderPresented
+            else { return }
             openedFolderID = nil
+            openedFolderOrigin = nil
         }
     }
 
     private func openAppFromFolder(_ app: InstalledApp) {
         openedFolderID = nil
+        openedFolderOrigin = nil
+        isFolderPresented = false
         library.open(app)
     }
 
     private func handleEscape() {
         if openedFolderID != nil {
             closeFolder()
+        } else if showsSettings {
+            showsSettings = false
+        } else if isSearching {
+            withAnimation(reduceMotion ? nil : .easeOut(duration: LaunchpadMotion.quick)) {
+                searchText = ""
+                currentPage = 0
+            }
+            focusedControl = .search
         } else {
             dismissLauncher()
         }
+    }
+
+    private func matchesSearch(_ candidate: String, query: String) -> Bool {
+        let normalizedQuery = compactSearchText(query)
+        guard !normalizedQuery.isEmpty else { return true }
+
+        let foldedCandidate = candidate.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: .current
+        )
+        if compactSearchText(foldedCandidate).contains(normalizedQuery) {
+            return true
+        }
+
+        guard let latinCandidate = foldedCandidate.applyingTransform(
+            .toLatin,
+            reverse: false
+        ) else { return false }
+        let foldedLatin = latinCandidate.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: .current
+        )
+        if compactSearchText(foldedLatin).contains(normalizedQuery) {
+            return true
+        }
+
+        let initials = foldedLatin
+            .split { !$0.isLetter && !$0.isNumber }
+            .compactMap(\.first)
+        return compactSearchText(String(initials)).contains(normalizedQuery)
+    }
+
+    private func compactSearchText(_ text: String) -> String {
+        text.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: .current
+        )
+        .lowercased()
+        .filter { $0.isLetter || $0.isNumber }
+    }
+
+    private func restoreBackup(_ document: LauncherBackupDocument) throws {
+        guard document.formatVersion == LauncherBackupDocument.currentVersion else {
+            throw LauncherBackupError.unsupportedVersion(document.formatVersion)
+        }
+
+        layoutStore.stageRestore(from: document.layout)
+        settings.restore(from: document.settings)
+        searchText = ""
+        keyboardSelectedItemID = nil
+        currentPage = 0
+        closeFolderImmediately()
+        library.reload(folders: settings.applicationFolders)
+    }
+
+    private func closeFolderImmediately() {
+        openedFolderID = nil
+        openedFolderOrigin = nil
+        isFolderPresented = false
+    }
+
+    private func handleKeyboardEvent(_ event: NSEvent) -> Bool {
+        guard openedFolderID == nil,
+              !showsSettings,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+        else { return false }
+
+        if event.keyCode == 48 {
+            let movesBackward = event.modifierFlags.contains(.shift)
+            switch (focusedControl, movesBackward) {
+            case (.search, false):
+                focusedControl = .settings
+            case (.settings, false):
+                focusedControl = nil
+                selectFirstItemOnCurrentPage()
+            case (nil, false):
+                focusedControl = .search
+                keyboardSelectedItemID = nil
+            case (.search, true):
+                focusedControl = nil
+                selectFirstItemOnCurrentPage()
+            case (.settings, true):
+                focusedControl = .search
+            case (nil, true):
+                focusedControl = .settings
+                keyboardSelectedItemID = nil
+            }
+            return true
+        }
+
+        if focusedControl == .settings,
+           event.keyCode == 36 || event.keyCode == 76 {
+            showsSettings = true
+            return true
+        }
+
+        if focusedControl == .search {
+            guard event.keyCode == 125 else { return false }
+            focusedControl = nil
+            selectFirstItemOnCurrentPage()
+            return true
+        }
+
+        switch event.keyCode {
+        case 123:
+            moveKeyboardSelection(by: -1)
+        case 124:
+            moveKeyboardSelection(by: 1)
+        case 125:
+            moveKeyboardSelection(by: settings.columnCount)
+        case 126:
+            moveKeyboardSelection(by: -settings.columnCount)
+        case 36, 49, 76:
+            guard keyboardSelectedItemID != nil else {
+                selectFirstItemOnCurrentPage()
+                return true
+            }
+            keyboardActivationRequest &+= 1
+        case 115:
+            currentPage = 0
+            selectFirstItemOnCurrentPage()
+        case 119:
+            currentPage = max(0, pageCount - 1)
+            selectFirstItemOnCurrentPage()
+        case 116:
+            currentPage = max(0, currentPage - 1)
+            selectFirstItemOnCurrentPage()
+        case 121:
+            currentPage = min(max(0, pageCount - 1), currentPage + 1)
+            selectFirstItemOnCurrentPage()
+        default:
+            return false
+        }
+        return true
+    }
+
+    private var pageCount: Int {
+        let pageSize = max(1, settings.columnCount * settings.rowCount)
+        return max(1, Int(ceil(Double(filteredItems.count) / Double(pageSize))))
+    }
+
+    private func moveKeyboardSelection(by offset: Int) {
+        guard !filteredItems.isEmpty else { return }
+        focusedControl = nil
+
+        let pageSize = settings.columnCount * settings.rowCount
+        let fallbackIndex = min(currentPage * pageSize, filteredItems.count - 1)
+        guard let currentIndex = keyboardSelectedItemID.flatMap({ selectedID in
+            filteredItems.firstIndex(where: { $0.id == selectedID })
+        }) else {
+            keyboardSelectedItemID = filteredItems[fallbackIndex].id
+            return
+        }
+        let destinationIndex = min(
+            max(0, currentIndex + offset),
+            filteredItems.count - 1
+        )
+        keyboardSelectedItemID = filteredItems[destinationIndex].id
+        currentPage = destinationIndex / pageSize
+    }
+
+    private func selectFirstItemOnCurrentPage() {
+        guard !filteredItems.isEmpty else {
+            keyboardSelectedItemID = nil
+            return
+        }
+        let pageSize = settings.columnCount * settings.rowCount
+        let firstIndex = min(currentPage * pageSize, filteredItems.count - 1)
+        keyboardSelectedItemID = filteredItems[firstIndex].id
+    }
+
+    private func keepKeyboardSelectionOnCurrentPage() {
+        guard let selectedID = keyboardSelectedItemID,
+              let selectedIndex = filteredItems.firstIndex(where: { $0.id == selectedID })
+        else { return }
+        let pageSize = settings.columnCount * settings.rowCount
+        guard selectedIndex / pageSize != currentPage else { return }
+        selectFirstItemOnCurrentPage()
     }
 }
 
@@ -735,7 +1230,11 @@ private struct MainPagerFramePreferenceKey: PreferenceKey {
 }
 
 private struct FolderOverlay: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     let folderID: String
+    let sourceOrigin: CGPoint?
+    let isPresented: Bool
     @ObservedObject var layoutStore: LaunchpadLayoutStore
     let openAction: (InstalledApp) -> Void
     let closeAction: () -> Void
@@ -747,25 +1246,38 @@ private struct FolderOverlay: View {
     @State private var folderItemFrames: [String: CGRect] = [:]
     @State private var folderReorderTargetID: String?
     @State private var hasExitedFolder = false
+    @State private var selectedFolderPage: Int? = 0
+    @State private var keyboardSelectedAppID: String?
+    @FocusState private var isFolderNameFocused: Bool
 
     var body: some View {
         if let folder = layoutStore.folder(withID: folderID) {
             GeometryReader { geometry in
                 let metrics = folderMetrics(in: geometry.size, appCount: folder.apps.count)
+                let collapsedCenter = sourceOrigin ?? CGPoint(
+                    x: metrics.panelFrame.midX,
+                    y: metrics.panelFrame.midY
+                )
+                let panelCenter = isPresented
+                    ? CGPoint(x: metrics.panelFrame.midX, y: metrics.panelFrame.midY)
+                    : collapsedCenter
+                let panelScale: CGFloat = isPresented ? 1 : 0.22
+                let folderPages = displayedApps(in: folder).chunked(
+                    into: metrics.pageCapacity
+                )
 
                 ZStack {
-                    ZStack {
-                        FolderVisualEffectView(
-                            material: .underWindowBackground,
-                            blendingMode: .withinWindow
-                        )
-                        .opacity(0.5)
-
-                        Color.black.opacity(0.2)
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture(perform: closeAction)
-                    .opacity(hasExitedFolder ? 0 : 1)
+                    // The wallpaper behind the launcher is already blurred.
+                    // A second full-screen NSVisualEffectView forces a costly
+                    // live blur pass when the folder appears; a composited dim
+                    // layer gives the same depth cue without the opening hitch.
+                    Color.black.opacity(0.28)
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: closeAction)
+                        .opacity(hasExitedFolder || !isPresented ? 0 : 1)
+                        .accessibilityLabel("关闭文件夹")
+                        .accessibilityHint("返回启动台")
+                        .accessibilityAddTraits(.isButton)
 
                     VStack(spacing: 18) {
                         TextField("文件夹名称", text: $draftName)
@@ -775,53 +1287,35 @@ private struct FolderOverlay: View {
                             .multilineTextAlignment(.center)
                             .frame(width: 360, height: 30)
                             .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
+                            .focused($isFolderNameFocused)
+                            .accessibilityLabel("文件夹名称")
+                            .accessibilityHint("输入新的名称后按回车保存")
                             .onSubmit(commitName)
 
-                        ScrollView(.vertical) {
-                            LazyVGrid(columns: metrics.columns, spacing: 22) {
-                                ForEach(displayedApps(in: folder)) { app in
-                                    FolderAppTile(
-                                        app: app,
-                                        isDragging: draggingAppID == app.id,
-                                        openAction: { openAction(app) },
-                                        revealAction: {
-                                            NSWorkspace.shared.activateFileViewerSelecting([app.url])
-                                        },
-                                        dragChanged: { location in
-                                            updateFolderDrag(
-                                                app,
-                                                at: location,
-                                                folder: folder,
-                                                panelFrame: metrics.panelFrame
-                                            )
-                                        },
-                                        dragEnded: { location in
-                                            finishDragging(
-                                                app,
-                                                at: location,
-                                                panelFrame: metrics.panelFrame
-                                            )
-                                        }
-                                    )
-                                    .zIndex(draggingAppID == app.id ? 2 : 0)
-                                    .background {
-                                        GeometryReader { itemGeometry in
-                                            Color.clear.preference(
-                                                key: FolderItemFramePreferenceKey.self,
-                                                value: [
-                                                    app.id: itemGeometry.frame(
-                                                        in: .named(FolderCoordinateSpace.name)
-                                                    )
-                                                ]
-                                            )
-                                        }
-                                    }
-                                }
+                        FolderPageGrid(
+                            pages: folderPages,
+                            columns: metrics.columns,
+                            gridHeight: metrics.gridHeight,
+                            selectedPage: $selectedFolderPage,
+                            draggingAppID: draggingAppID,
+                            keyboardSelectedAppID: keyboardSelectedAppID,
+                            openAction: openAction,
+                            dragChanged: { app, location in
+                                updateFolderDrag(
+                                    app,
+                                    at: location,
+                                    folder: folder,
+                                    panelFrame: metrics.panelFrame
+                                )
+                            },
+                            dragEnded: { app, location in
+                                finishDragging(
+                                    app,
+                                    at: location,
+                                    panelFrame: metrics.panelFrame
+                                )
                             }
-                            .padding(.horizontal, 32)
-                            .padding(.vertical, 6)
-                        }
-                        .scrollIndicators(.hidden)
+                        )
                     }
                     .padding(.top, 22)
                     .padding(.bottom, 24)
@@ -849,13 +1343,22 @@ private struct FolderOverlay: View {
                     }
                     .overlay {
                         RoundedRectangle(cornerRadius: 30, style: .continuous)
-                            .strokeBorder(.white.opacity(0.22), lineWidth: 1)
+                            .strokeBorder(
+                                .white.opacity(colorSchemeContrast == .increased ? 0.8 : 0.22),
+                                lineWidth: colorSchemeContrast == .increased ? 2 : 1
+                            )
                     }
                     .shadow(color: .black.opacity(0.38), radius: 42, y: 18)
                     .contentShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
-                    .position(x: metrics.panelFrame.midX, y: metrics.panelFrame.midY)
                     .onTapGesture { }
-                    .opacity(hasExitedFolder ? 0 : 1)
+                    // Interpolate both center and size. This produces a true
+                    // folder-to-panel expansion and the exact reverse path on
+                    // close, independent of SwiftUI transform-anchor ordering.
+                    .scaleEffect(panelScale)
+                    .position(x: panelCenter.x, y: panelCenter.y)
+                    .opacity(hasExitedFolder || !isPresented ? 0 : 1)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("文件夹 \(folder.name)")
 
                     if let draggingApp = folder.apps.first(where: { $0.id == draggingAppID }) {
                         FolderDragPreview(app: draggingApp)
@@ -863,6 +1366,9 @@ private struct FolderOverlay: View {
                             .allowsHitTesting(false)
                             .zIndex(100)
                     }
+
+                    LauncherKeyboardMonitor(action: handleFolderKeyboardEvent)
+                        .frame(width: 0, height: 0)
                 }
                 .coordinateSpace(name: FolderCoordinateSpace.name)
                 .onPreferenceChange(FolderItemFramePreferenceKey.self) {
@@ -875,6 +1381,8 @@ private struct FolderOverlay: View {
                 draftName = folder.name
                 previewAppIDs = folder.apps.map(\.id)
                 hasExitedFolder = false
+                selectedFolderPage = 0
+                keyboardSelectedAppID = nil
             }
             .onChange(of: folder.name) {
                 draftName = folder.name
@@ -882,6 +1390,10 @@ private struct FolderOverlay: View {
             .onChange(of: folder.apps.map(\.id)) { _, appIDs in
                 guard draggingAppID == nil else { return }
                 previewAppIDs = appIDs
+                if let keyboardSelectedAppID,
+                   !appIDs.contains(keyboardSelectedAppID) {
+                    self.keyboardSelectedAppID = nil
+                }
             }
         }
     }
@@ -910,7 +1422,7 @@ private struct FolderOverlay: View {
         if !panelFrame.contains(location) {
             guard !hasExitedFolder else { return }
             folderReorderTargetID = nil
-            withAnimation(.easeOut(duration: 0.16)) {
+            withAnimation(reduceMotion ? nil : .easeOut(duration: LaunchpadMotion.quick)) {
                 hasExitedFolder = true
             }
             return
@@ -940,7 +1452,7 @@ private struct FolderOverlay: View {
         let sourceID = reorderedIDs.remove(at: sourceIndex)
         reorderedIDs.insert(sourceID, at: min(targetIndex, reorderedIDs.count))
 
-        withAnimation(.easeOut(duration: 0.17)) {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: LaunchpadMotion.standard)) {
             previewAppIDs = reorderedIDs
         }
     }
@@ -955,15 +1467,34 @@ private struct FolderOverlay: View {
         let contentWidth = CGFloat(visibleColumns) * 138
             + CGFloat(max(0, visibleColumns - 1)) * 20
         let panelWidth = min(size.width - 96, max(680, contentWidth + 76))
-        let rows = max(1, Int(ceil(Double(appCount) / Double(visibleColumns))))
-        let panelHeight = min(size.height - 132, max(276, 100 + CGFloat(rows) * 154))
+        let rowsPerPage = 3
+        let pageCapacity = visibleColumns * rowsPerPage
+        let pageCount = max(1, Int(ceil(Double(appCount) / Double(pageCapacity))))
+        let visibleItemCount = min(max(1, appCount), pageCapacity)
+        let visibleRows = min(
+            rowsPerPage,
+            max(1, Int(ceil(Double(visibleItemCount) / Double(visibleColumns))))
+        )
+        let gridHeight = CGFloat(visibleRows) * 139
+            + CGFloat(max(0, visibleRows - 1)) * 22
+            + 12
+        let chromeHeight: CGFloat = pageCount > 1 ? 120 : 94
+        let panelHeight = min(
+            size.height - 132,
+            max(276, gridHeight + chromeHeight)
+        )
         let panelFrame = CGRect(
             x: (size.width - panelWidth) / 2,
             y: (size.height - panelHeight) / 2 - 8,
             width: panelWidth,
             height: panelHeight
         )
-        return FolderMetrics(columns: columns, panelFrame: panelFrame)
+        return FolderMetrics(
+            columns: columns,
+            pageCapacity: pageCapacity,
+            gridHeight: gridHeight,
+            panelFrame: panelFrame
+        )
     }
 
     private func finishDragging(
@@ -976,7 +1507,7 @@ private struct FolderOverlay: View {
             layoutStore.reorderApps(inFolder: folderID, orderedAppIDs: previewAppIDs)
         }
 
-        withAnimation(.easeOut(duration: 0.15)) {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: LaunchpadMotion.quick)) {
             draggingAppID = nil
         }
         folderReorderTargetID = nil
@@ -996,11 +1527,277 @@ private struct FolderOverlay: View {
         layoutStore.renameFolder(folderID, to: draftName)
         draftName = layoutStore.folder(withID: folderID)?.name ?? draftName
     }
+
+    private func handleFolderKeyboardEvent(_ event: NSEvent) -> Bool {
+        guard draggingAppID == nil,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+              let folder = layoutStore.folder(withID: folderID)
+        else { return false }
+
+        let apps = displayedApps(in: folder)
+        guard !apps.isEmpty else { return false }
+        let pageCapacity = max(1, folderPageCapacity(appCount: apps.count))
+
+        if event.keyCode == 48 {
+            if isFolderNameFocused {
+                isFolderNameFocused = false
+                selectFirstFolderApp(apps, pageCapacity: pageCapacity)
+            } else if event.modifierFlags.contains(.shift) {
+                keyboardSelectedAppID = nil
+                isFolderNameFocused = true
+            } else if keyboardSelectedAppID == nil {
+                selectFirstFolderApp(apps, pageCapacity: pageCapacity)
+            } else {
+                keyboardSelectedAppID = nil
+                isFolderNameFocused = true
+            }
+            return true
+        }
+
+        if isFolderNameFocused {
+            guard event.keyCode == 125 else { return false }
+            isFolderNameFocused = false
+            selectFirstFolderApp(apps, pageCapacity: pageCapacity)
+            return true
+        }
+
+        switch event.keyCode {
+        case 123:
+            moveFolderKeyboardSelection(by: -1, apps: apps, pageCapacity: pageCapacity)
+        case 124:
+            moveFolderKeyboardSelection(by: 1, apps: apps, pageCapacity: pageCapacity)
+        case 125:
+            moveFolderKeyboardSelection(
+                by: folderColumnCount(appCount: apps.count),
+                apps: apps,
+                pageCapacity: pageCapacity
+            )
+        case 126:
+            moveFolderKeyboardSelection(
+                by: -folderColumnCount(appCount: apps.count),
+                apps: apps,
+                pageCapacity: pageCapacity
+            )
+        case 36, 49, 76:
+            guard let keyboardSelectedAppID,
+                  let app = apps.first(where: { $0.id == keyboardSelectedAppID })
+            else {
+                selectFirstFolderApp(apps, pageCapacity: pageCapacity)
+                return true
+            }
+            openAction(app)
+        case 115:
+            selectFolderPage(0, apps: apps, pageCapacity: pageCapacity)
+        case 119:
+            selectFolderPage(
+                max(0, Int(ceil(Double(apps.count) / Double(pageCapacity))) - 1),
+                apps: apps,
+                pageCapacity: pageCapacity
+            )
+        case 116:
+            selectFolderPage(
+                max(0, (selectedFolderPage ?? 0) - 1),
+                apps: apps,
+                pageCapacity: pageCapacity
+            )
+        case 121:
+            let lastPage = max(0, Int(ceil(Double(apps.count) / Double(pageCapacity))) - 1)
+            selectFolderPage(
+                min(lastPage, (selectedFolderPage ?? 0) + 1),
+                apps: apps,
+                pageCapacity: pageCapacity
+            )
+        default:
+            return false
+        }
+        return true
+    }
+
+    private func folderColumnCount(appCount: Int) -> Int {
+        let maximumColumns = min(
+            7,
+            max(4, Int((currentFolderScreenSize.width - 150) / 150))
+        )
+        return min(maximumColumns, max(4, appCount))
+    }
+
+    private var currentFolderScreenSize: CGSize {
+        LauncherWindowController.shared.activeScreen?.frame.size
+            ?? NSScreen.main?.frame.size
+            ?? CGSize(width: 1440, height: 900)
+    }
+
+    private func folderPageCapacity(appCount: Int) -> Int {
+        folderColumnCount(appCount: appCount) * 3
+    }
+
+    private func selectFirstFolderApp(_ apps: [InstalledApp], pageCapacity: Int) {
+        let index = min((selectedFolderPage ?? 0) * pageCapacity, apps.count - 1)
+        keyboardSelectedAppID = apps[index].id
+    }
+
+    private func moveFolderKeyboardSelection(
+        by offset: Int,
+        apps: [InstalledApp],
+        pageCapacity: Int
+    ) {
+        guard let currentIndex = keyboardSelectedAppID.flatMap({ selectedID in
+            apps.firstIndex(where: { $0.id == selectedID })
+        }) else {
+            selectFirstFolderApp(apps, pageCapacity: pageCapacity)
+            return
+        }
+        let destination = min(max(0, currentIndex + offset), apps.count - 1)
+        keyboardSelectedAppID = apps[destination].id
+        selectedFolderPage = destination / pageCapacity
+    }
+
+    private func selectFolderPage(
+        _ page: Int,
+        apps: [InstalledApp],
+        pageCapacity: Int
+    ) {
+        selectedFolderPage = page
+        let index = min(page * pageCapacity, apps.count - 1)
+        keyboardSelectedAppID = apps[index].id
+    }
 }
 
 private struct FolderMetrics {
     let columns: [GridItem]
+    let pageCapacity: Int
+    let gridHeight: CGFloat
     let panelFrame: CGRect
+}
+
+private struct FolderPageGrid: View {
+    let pages: [[InstalledApp]]
+    let columns: [GridItem]
+    let gridHeight: CGFloat
+    @Binding var selectedPage: Int?
+    let draggingAppID: String?
+    let keyboardSelectedAppID: String?
+    let openAction: (InstalledApp) -> Void
+    let dragChanged: (InstalledApp, CGPoint) -> Void
+    let dragEnded: (InstalledApp, CGPoint) -> Void
+
+    var body: some View {
+        VStack(spacing: 18) {
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 0) {
+                    ForEach(pages.indices, id: \.self) { pageIndex in
+                        LazyVGrid(columns: columns, spacing: 22) {
+                            ForEach(pages[pageIndex]) { app in
+                                FolderPageAppCell(
+                                    app: app,
+                                    isDragging: draggingAppID == app.id,
+                                    isKeyboardFocused: keyboardSelectedAppID == app.id,
+                                    openAction: { openAction(app) },
+                                    dragChanged: { dragChanged(app, $0) },
+                                    dragEnded: { dragEnded(app, $0) }
+                                )
+                            }
+                        }
+                        .padding(.horizontal, 32)
+                        .padding(.vertical, 6)
+                        .containerRelativeFrame(.horizontal)
+                        .id(pageIndex)
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollIndicators(.hidden)
+            .scrollTargetBehavior(.paging)
+            .scrollPosition(id: $selectedPage)
+            .frame(height: gridHeight)
+
+            if pages.count > 1 {
+                FolderPageIndicator(
+                    pageCount: pages.count,
+                    selectedPage: $selectedPage
+                )
+            }
+        }
+        .onAppear(perform: clampSelectedPage)
+        .onChange(of: pages.count) { _, _ in
+            clampSelectedPage()
+        }
+    }
+
+    private func clampSelectedPage() {
+        let lastPage = max(0, pages.count - 1)
+        selectedPage = min(selectedPage ?? 0, lastPage)
+    }
+}
+
+private struct FolderPageIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
+    let pageCount: Int
+    @Binding var selectedPage: Int?
+
+    var body: some View {
+        HStack(spacing: 9) {
+            ForEach(0..<pageCount, id: \.self) { pageIndex in
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: LaunchpadMotion.standard)) {
+                        selectedPage = pageIndex
+                    }
+                } label: {
+                    Circle()
+                        .fill(
+                            .white.opacity(
+                                selectedPage == pageIndex ? 0.94 : 0.3
+                            )
+                        )
+                        .frame(
+                            width: selectedPage == pageIndex && differentiateWithoutColor ? 9 : 7,
+                            height: selectedPage == pageIndex && differentiateWithoutColor ? 9 : 7
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("文件夹第 \(pageIndex + 1) 页")
+                .accessibilityValue(selectedPage == pageIndex ? "当前页" : "")
+            }
+        }
+        .frame(height: 8)
+    }
+}
+
+private struct FolderPageAppCell: View {
+    let app: InstalledApp
+    let isDragging: Bool
+    let isKeyboardFocused: Bool
+    let openAction: () -> Void
+    let dragChanged: (CGPoint) -> Void
+    let dragEnded: (CGPoint) -> Void
+
+    var body: some View {
+        FolderAppTile(
+            app: app,
+            isDragging: isDragging,
+            isKeyboardFocused: isKeyboardFocused,
+            openAction: openAction,
+            revealAction: {
+                NSWorkspace.shared.activateFileViewerSelecting([app.url])
+            },
+            dragChanged: dragChanged,
+            dragEnded: dragEnded
+        )
+        .zIndex(isDragging ? 2 : 0)
+        .background {
+            GeometryReader { itemGeometry in
+                Color.clear.preference(
+                    key: FolderItemFramePreferenceKey.self,
+                    value: [
+                        app.id: itemGeometry.frame(
+                            in: .named(FolderCoordinateSpace.name)
+                        )
+                    ]
+                )
+            }
+        }
+    }
 }
 
 private enum FolderCoordinateSpace {
@@ -1019,8 +1816,11 @@ private struct FolderItemFramePreferenceKey: PreferenceKey {
 }
 
 private struct FolderAppTile: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     let app: InstalledApp
     let isDragging: Bool
+    let isKeyboardFocused: Bool
     let openAction: () -> Void
     let revealAction: () -> Void
     let dragChanged: (CGPoint) -> Void
@@ -1034,6 +1834,15 @@ private struct FolderAppTile: View {
                 .scaledToFit()
                 .frame(width: 94, height: 94)
                 .shadow(color: .black.opacity(0.32), radius: 8, y: 5)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(
+                            .white.opacity(colorSchemeContrast == .increased ? 1 : 0.78),
+                            lineWidth: colorSchemeContrast == .increased ? 3 : 2
+                        )
+                        .padding(-7)
+                        .opacity(isKeyboardFocused ? 1 : 0)
+                }
 
             Text(app.name)
                 .font(.system(size: 14, weight: .semibold))
@@ -1047,7 +1856,10 @@ private struct FolderAppTile: View {
         .contentShape(Rectangle())
         .opacity(isDragging ? 0.12 : 1)
         .scaleEffect(isDragging ? 0.96 : 1)
-        .animation(.easeOut(duration: 0.12), value: isDragging)
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: LaunchpadMotion.quick),
+            value: isDragging
+        )
         .onTapGesture(perform: openAction)
         .gesture(
             DragGesture(
@@ -1062,6 +1874,11 @@ private struct FolderAppTile: View {
             Button("在 Finder 中显示", action: revealAction)
         }
         .help(app.name)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(app.name)
+        .accessibilityValue("应用")
+        .accessibilityHint("按下以打开应用，也可以拖动调整位置")
+        .accessibilityAddTraits(.isButton)
     }
 }
 
@@ -1111,21 +1928,28 @@ private struct FolderVisualEffectView: NSViewRepresentable {
 }
 
 private struct LaunchpadButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.92 : 1)
+            .scaleEffect(reduceMotion ? 1 : (configuration.isPressed ? 0.92 : 1))
             .opacity(configuration.isPressed ? 0.84 : 1)
-            .animation(.spring(response: 0.18, dampingFraction: 0.68), value: configuration.isPressed)
+            .animation(
+                reduceMotion
+                    ? nil
+                    : .spring(response: LaunchpadMotion.standard, dampingFraction: 0.72),
+                value: configuration.isPressed
+            )
     }
 }
 
 private struct DesktopWallpaperView: View {
-    private static let wallpaper = loadWallpaper()
+    @State private var wallpaper = Self.loadWallpaper()
 
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                if let wallpaper = Self.wallpaper {
+                if let wallpaper {
                     Image(nsImage: wallpaper)
                         .resizable()
                         .interpolation(.high)
@@ -1161,10 +1985,18 @@ private struct DesktopWallpaperView: View {
             .clipped()
         }
         .ignoresSafeArea()
+        .onReceive(
+            NotificationCenter.default.publisher(for: .launcherScreenDidChange)
+        ) { _ in
+            wallpaper = Self.loadWallpaper()
+        }
     }
 
     private static func loadWallpaper() -> NSImage? {
-        let screen = NSScreen.main ?? NSScreen.screens.first
+        let screen = LauncherWindowController.shared.activeScreen
+            ?? NSScreen.screenContainingMouse
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
         guard let screen,
               let url = NSWorkspace.shared.desktopImageURL(for: screen)
         else {
@@ -1172,6 +2004,58 @@ private struct DesktopWallpaperView: View {
         }
 
         return NSImage(contentsOf: url)
+    }
+}
+
+private struct LauncherKeyboardMonitor: NSViewRepresentable {
+    let action: (NSEvent) -> Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(action: action)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        context.coordinator.start()
+        return NSView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.action = action
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.stop()
+    }
+
+    final class Coordinator {
+        var action: (NSEvent) -> Bool
+        private var monitor: Any?
+
+        init(action: @escaping (NSEvent) -> Bool) {
+            self.action = action
+        }
+
+        func start() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard NSApplication.shared.isActive,
+                      event.keyCode != 53,
+                      self?.action(event) == true
+                else { return event }
+                return nil
+            }
+        }
+
+        func stop() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+
+        deinit {
+            stop()
+        }
     }
 }
 

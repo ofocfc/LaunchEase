@@ -1,6 +1,37 @@
 import AppKit
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
+
+struct LauncherSettingsBackup: Codable {
+    let applicationFolderPaths: [String]
+    let rowCount: Int
+    let columnCount: Int
+    let appIconChoice: String
+}
+
+struct LauncherBackupDocument: Codable {
+    static let currentVersion = 1
+
+    let formatVersion: Int
+    let exportedAt: Date
+    let settings: LauncherSettingsBackup
+    let layout: LaunchpadLayoutBackup
+}
+
+enum LauncherBackupError: LocalizedError {
+    case unsupportedVersion(Int)
+    case fileTooLarge
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedVersion(let version):
+            return "不支持版本为 \(version) 的备份文件。"
+        case .fileTooLarge:
+            return "备份文件过大，无法导入。"
+        }
+    }
+}
 
 enum LauncherIconChoice: String, CaseIterable, Identifiable {
     case softColor
@@ -137,6 +168,28 @@ final class LauncherSettings: ObservableObject {
         applicationFolderPaths = Self.defaultApplicationFolders
     }
 
+    func makeBackup() -> LauncherSettingsBackup {
+        LauncherSettingsBackup(
+            applicationFolderPaths: applicationFolderPaths,
+            rowCount: rowCount,
+            columnCount: columnCount,
+            appIconChoice: appIconChoice.rawValue
+        )
+    }
+
+    func restore(from backup: LauncherSettingsBackup) {
+        var insertedPaths = Set<String>()
+        applicationFolderPaths = backup.applicationFolderPaths
+            .prefix(128)
+            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
+            .filter { !$0.isEmpty && insertedPaths.insert($0).inserted }
+        rowCount = min(max(backup.rowCount, 3), 6)
+        columnCount = min(max(backup.columnCount, 4), 8)
+        if let iconChoice = LauncherIconChoice(rawValue: backup.appIconChoice) {
+            appIconChoice = iconChoice
+        }
+    }
+
     private enum Keys {
         static let applicationFolderPaths = "launcher.applicationFolderPaths"
         static let rowCount = "launcher.gridRows"
@@ -147,7 +200,10 @@ final class LauncherSettings: ObservableObject {
 
 struct LauncherSettingsView: View {
     @ObservedObject var settings: LauncherSettings
+    @ObservedObject var layoutStore: LaunchpadLayoutStore
     @Binding var isPresented: Bool
+    let importAction: (LauncherBackupDocument) throws -> Void
+    @State private var backupNotice: BackupNotice?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -165,6 +221,7 @@ struct LauncherSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("关闭启动台设置")
             }
 
             VStack(alignment: .leading, spacing: 10) {
@@ -245,9 +302,116 @@ struct LauncherSettingsView: View {
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Label("设置备份", systemImage: "externaldrive.badge.timemachine")
+                    .font(.system(size: 14, weight: .semibold))
+
+                HStack(spacing: 12) {
+                    Button("导出备份…", systemImage: "square.and.arrow.up") {
+                        exportBackup()
+                    }
+
+                    Button("导入备份…", systemImage: "square.and.arrow.down") {
+                        importBackup()
+                    }
+
+                    Spacer()
+                }
+                .controlSize(.small)
+
+                Text("备份包含扫描目录、行列数、图标主题、应用顺序和文件夹。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(20)
         .frame(width: 430)
+        .alert(item: $backupNotice) { notice in
+            Alert(
+                title: Text(notice.title),
+                message: Text(notice.message),
+                dismissButton: .default(Text("好"))
+            )
+        }
+    }
+
+    private func exportBackup() {
+        let panel = NSSavePanel()
+        panel.title = "导出 LaunchEase 备份"
+        panel.prompt = "导出"
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "LaunchEase-Backup.json"
+
+        LauncherWindowController.shared.presentSavePanel(panel) { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let document = LauncherBackupDocument(
+                    formatVersion: LauncherBackupDocument.currentVersion,
+                    exportedAt: Date(),
+                    settings: settings.makeBackup(),
+                    layout: layoutStore.makeBackup()
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+                let data = try encoder.encode(document)
+                try data.write(to: url, options: .atomic)
+                backupNotice = BackupNotice(
+                    title: "导出成功",
+                    message: "备份已保存为 \(url.lastPathComponent)。"
+                )
+            } catch {
+                showBackupError(error)
+            }
+        }
+    }
+
+    private func importBackup() {
+        let panel = NSOpenPanel()
+        panel.title = "导入 LaunchEase 备份"
+        panel.prompt = "导入"
+        panel.allowedContentTypes = [.json]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+
+        LauncherWindowController.shared.presentFolderPicker(panel) { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let fileSize = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                guard fileSize <= 5_000_000 else {
+                    throw LauncherBackupError.fileTooLarge
+                }
+                let data = try Data(contentsOf: url)
+                let document = try JSONDecoder().decode(
+                    LauncherBackupDocument.self,
+                    from: data
+                )
+                try importAction(document)
+                backupNotice = BackupNotice(
+                    title: "导入成功",
+                    message: "正在重新扫描应用并恢复布局。"
+                )
+            } catch {
+                showBackupError(error)
+            }
+        }
+    }
+
+    private func showBackupError(_ error: Error) {
+        backupNotice = BackupNotice(
+            title: "无法处理备份",
+            message: error.localizedDescription
+        )
+    }
+
+    private struct BackupNotice: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
     }
 
     private func iconChoiceButton(_ choice: LauncherIconChoice) -> some View {
@@ -293,6 +457,9 @@ struct LauncherSettingsView: View {
             }
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("应用图标：\(choice.title)")
+        .accessibilityValue(settings.appIconChoice == choice ? "已选择" : "未选择")
+        .accessibilityHint("选择后立即更新程序坞图标")
     }
 
     private func folderRow(_ path: String) -> some View {
@@ -323,6 +490,8 @@ struct LauncherSettingsView: View {
             }
             .buttonStyle(.plain)
             .help("停止扫描此文件夹")
+            .accessibilityLabel("移除 \(URL(fileURLWithPath: path).lastPathComponent)")
+            .accessibilityHint("停止扫描此文件夹")
         }
         .padding(.horizontal, 10)
         .frame(height: 48)
@@ -345,6 +514,8 @@ struct LauncherSettingsView: View {
                     .monospacedDigit()
                     .frame(width: 24)
             }
+            .accessibilityLabel(title)
+            .accessibilityValue("\(value.wrappedValue)")
         }
         .padding(.horizontal, 12)
         .frame(maxWidth: .infinity, minHeight: 44)
